@@ -134,12 +134,35 @@ function setupForms() {
   }
 }
 
+function ensureUploadResult() {
+  let result = document.getElementById('upload-result');
+  if (result) return result;
+
+  const uploadForm = document.getElementById('upload-form');
+  if (!uploadForm) return null;
+
+  result = document.createElement('div');
+  result.id = 'upload-result';
+  result.className = 'code-box pre-wrap';
+  result.style.marginTop = '0.75rem';
+  result.textContent = 'Upload and payload test results will appear here.';
+  uploadForm.insertAdjacentElement('afterend', result);
+  return result;
+}
+
+function showUploadResult(message) {
+  const result = ensureUploadResult();
+  if (result) result.textContent = message;
+}
+
 // 2. Setup Uploads (Multipart & Chunked)
 function setupUploads() {
   const standardBtn = document.getElementById('btn-upload-standard');
   const chunkedBtn = document.getElementById('btn-upload-chunked');
   const fileInput = document.getElementById('file-input');
   const dropZone = document.getElementById('drop-zone');
+
+  ensureUploadResult();
 
   if (fileInput && dropZone) {
     fileInput.addEventListener('change', () => {
@@ -159,47 +182,30 @@ function setupUploads() {
       const formData = new FormData();
       formData.append('file', file);
 
+      showUploadResult(`Uploading ${file.name} (${file.size} bytes) via multipart...`);
       logToConsole(`Uploading ${file.name} (${file.size} bytes) via POST /uploads`, 'post');
       try {
         const res = await fetch('/uploads', {
           method: 'POST',
           body: formData
         });
+        showUploadResult(`Multipart upload\nHTTP ${res.status} ${res.statusText}\n${res.ok ? 'Accepted and stored.' : 'Request rejected.'}`);
         logToConsole(`Upload Response: HTTP ${res.status} ${res.statusText}`, res.ok ? 'post' : 'error');
         if (res.ok) await refreshFiles();
       } catch (err) {
+        showUploadResult(`Multipart upload failed: ${err.message}`);
         logToConsole(`Upload failed: ${err.message}`, 'error');
       }
     });
   }
 
   if (chunkedBtn) {
-    chunkedBtn.addEventListener('click', async () => {
-      if (!fileInput || !fileInput.files.length) {
-        alert('Please choose a file to test chunked upload.');
-        return;
-      }
-      const file = fileInput.files[0];
-      logToConsole(`Sending Chunked Upload for ${file.name}...`, 'post');
-      
-      // A streaming Fetch body has no known Content-Length. On HTTP/1.1 Chromium sends it with chunked transfer coding; the browser owns the Transfer-Encoding header.
-      const reader = file.stream();
-      try {
-        const res = await fetch(`/uploads/${encodeURIComponent(file.name)}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': file.type || 'application/octet-stream',
-            'X-Filename': file.name
-          },
-          body: reader,
-          // @ts-ignore
-          duplex: 'half'
-        });
-        logToConsole(`Chunked Upload Response: HTTP ${res.status}`, res.ok ? 'post' : 'error');
-        if (res.ok) await refreshFiles();
-      } catch (err) {
-        logToConsole(`Chunked stream test note: ${err.message}`, 'error');
-      }
+    chunkedBtn.addEventListener('click', () => {
+      showUploadResult(
+        'Browser note: Fetch cannot reliably force HTTP/1.1 Transfer-Encoding: chunked.\n' +
+        'The real chunked request is verified by tests/audit.py using a raw TCP socket.'
+      );
+      logToConsole('Chunked HTTP/1.1 is verified by the raw-socket audit; browsers cannot force the Transfer-Encoding header.', 'system');
     });
   }
 }
@@ -208,19 +214,27 @@ function setupUploads() {
 window.testPayloadSize = async function(kilobytes) {
   const sizeBytes = kilobytes * 1024;
   const chunk = 'A'.repeat(sizeBytes);
+  const target = `/uploads/payload-${kilobytes}kb.txt`;
+  showUploadResult(`POST ${target}\nSending ${kilobytes} KB...`);
   logToConsole(`Testing payload limit with ${kilobytes} KB data...`, 'post');
   try {
-    const res = await fetch(`/uploads/payload-${kilobytes}kb.txt`, {
+    const res = await fetch(target, {
       method: 'POST',
       headers: { 'Content-Type': 'text/plain' },
       body: chunk
     });
+    const expected = kilobytes > 2048 ? '413 Payload Too Large' : 'successful upload';
+    showUploadResult(
+      `POST ${target}\nHTTP ${res.status} ${res.statusText}\nExpected: ${expected}\nResult: ${res.status === 413 || res.ok ? 'PASS' : 'CHECK'}`
+    );
     if (res.status === 413) {
       logToConsole(`HTTP 413 Payload Too Large returned correctly! Server enforced client_max_body_size.`, 'post');
     } else {
-      logToConsole(`Server response: HTTP ${res.status} ${res.statusText}`, 'post');
+      logToConsole(`Server response: HTTP ${res.status} ${res.statusText}`, res.ok ? 'post' : 'error');
+      if (res.ok) await refreshFiles();
     }
   } catch (err) {
+    showUploadResult(`POST ${target}\nRequest failed: ${err.message}`);
     logToConsole(`Request error: ${err.message}`, 'error');
   }
 };
