@@ -31,9 +31,11 @@ def request(method: str, path: str, body: bytes | None = None, headers: dict[str
     return result
 
 
-def raw_http(payload: bytes, port: int = PORT) -> bytes:
+def raw_http(payload: bytes, port: int = PORT, half_close: bool = False) -> bytes:
     with socket.create_connection((HOST, port), timeout=5) as sock:
         sock.sendall(payload)
+        if half_close:
+            sock.shutdown(socket.SHUT_WR)
         chunks = []
         while True:
             data = sock.recv(65536)
@@ -96,6 +98,12 @@ def run(binary: Path):
         check("GET static index", status == 200 and b"Localhost Web Server" in body)
         check("response has Content-Length", "Content-Length" in headers)
 
+        half_closed = raw_http(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            half_close=True,
+        )
+        check("half-closed client still receives response", half_closed.startswith(b"HTTP/1.1 200"))
+
         status, _, body = request("GET", "/", port=PORT2)
         check("second configured port", status == 200 and b"Localhost Web Server" in body)
 
@@ -110,6 +118,9 @@ def run(binary: Path):
 
         status, headers, _ = request("DELETE", "/")
         check("route method restriction", status == 405 and "Allow" in headers)
+
+        status, _, _ = request("POST", "/", b"not-an-echo")
+        check("ordinary route rejects POST", status == 405)
 
         payload = b'{"message":"audit"}'
         status, _, body = request("POST", "/api/echo", payload, {"Content-Type": "application/json"})
@@ -129,8 +140,12 @@ def run(binary: Path):
             "upload/download integrity",
             status == 200 and hashlib.sha256(downloaded).digest() == hashlib.sha256(file_bytes).digest(),
         )
-        status, _, _ = request("DELETE", "/uploads/integrity.bin")
+        status, headers, _ = request("DELETE", "/uploads/integrity.bin")
         check("DELETE uploaded file", status == 204)
+        check(
+            "204 has no entity headers",
+            "Content-Length" not in headers and "Content-Type" not in headers,
+        )
         status, _, _ = request("GET", "/uploads/integrity.bin")
         check("deleted file is gone", status == 404)
 
@@ -163,6 +178,25 @@ def run(binary: Path):
             and b"HTTP/1.1 200 OK" in pipelined
             and pipelined.endswith(b"Wikipedia"),
         )
+
+        early_413 = raw_http(
+            b"POST /uploads/declared-too-big.bin HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Type: application/octet-stream\r\n"
+            b"Content-Length: 31457280\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        check("Content-Length limit rejected before body upload", early_413.startswith(b"HTTP/1.1 413"))
+
+        chunked_413 = raw_http(
+            b"POST /uploads/chunk-too-big.bin HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Content-Type: application/octet-stream\r\n"
+            b"Connection: close\r\n\r\n"
+            b"300000\r\n"
+        )
+        check("chunked limit rejected from chunk size", chunked_413.startswith(b"HTTP/1.1 413"))
 
         status, headers, body = request("GET", "/session?user=Auditor")
         cookie = headers.get("Set-Cookie", "").split(";", 1)[0]

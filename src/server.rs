@@ -1,6 +1,9 @@
 use crate::cgi::{cgi_error_response, parse_cgi_output, spawn_cgi, CgiSpec, CgiTask};
 use crate::config::{RouteConfig, ServerConfig};
-use crate::http::{mime_type, try_parse_request, ParseResult, Request, Response};
+use crate::http::{
+    mime_type, try_parse_request_body, try_parse_request_head, BodyParseResult, ChunkProgress,
+    HeadParseResult, Request, RequestHead, Response,
+};
 use crate::util::{html_escape, normalize_url_path, safe_join, sanitize_filename};
 use std::collections::HashMap;
 use std::fs;
@@ -20,14 +23,22 @@ struct ListenerEntry {
     server_indices: Vec<usize>,
 }
 
+struct PendingRequest {
+    head: RequestHead,
+    server_index: usize,
+    chunk_progress: ChunkProgress,
+}
+
 struct Client {
     stream: TcpStream,
     listener_fd: RawFd,
+    generation: u32,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
     write_pos: usize,
     close_after_write: bool,
-    processing: bool,
+    peer_closed: bool,
+    pending: Option<PendingRequest>,
     last_active: Instant,
 }
 
@@ -55,6 +66,7 @@ pub struct HttpServer {
     cgi_tasks: HashMap<RawFd, CgiTask>,
     sessions: HashMap<String, Session>,
     session_seq: u64,
+    next_generation: u32,
 }
 
 impl HttpServer {
@@ -71,6 +83,7 @@ impl HttpServer {
             cgi_tasks: HashMap::new(),
             sessions: HashMap::new(),
             session_seq: 0,
+            next_generation: 0,
         };
         if let Err(err) = server.bind_listeners() {
             unsafe { libc::close(epoll_fd) };
@@ -92,7 +105,7 @@ impl HttpServer {
                 Ok(listener) => {
                     listener.set_nonblocking(true)?;
                     let fd = listener.as_raw_fd();
-                    self.epoll_add(fd, (libc::EPOLLIN | libc::EPOLLRDHUP) as u32)?;
+                    self.epoll_add_listener(fd, (libc::EPOLLIN | libc::EPOLLRDHUP) as u32)?;
                     eprintln!("listening on {addr}");
                     self.listeners.insert(
                         fd,
@@ -140,23 +153,34 @@ impl HttpServer {
             self.poll_cgi_tasks();
 
             for event in events.iter().take(count as usize) {
-                let fd = event.u64 as RawFd;
+                let token = event.u64;
+                let fd = token_fd(token);
+                let generation = token_generation(token);
                 let flags = event.events;
-                if self.listeners.contains_key(&fd) {
-                    self.accept_once(fd);
+
+                if generation == 0 {
+                    if self.listeners.contains_key(&fd) {
+                        self.accept_once(fd);
+                    }
                     continue;
                 }
-                if !self.clients.contains_key(&fd) {
+
+                let current_generation = self.clients.get(&fd).map(|client| client.generation);
+                if current_generation != Some(generation) {
                     continue;
                 }
-                if flags & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0 {
+
+                if flags & libc::EPOLLERR as u32 != 0 {
                     self.remove_client(fd);
                     continue;
                 }
-                if flags & libc::EPOLLRDHUP as u32 != 0 {
-                    self.remove_client(fd);
-                    continue;
+
+                if flags & (libc::EPOLLRDHUP | libc::EPOLLHUP) as u32 != 0 {
+                    if let Some(client) = self.clients.get_mut(&fd) {
+                        client.peer_closed = true;
+                    }
                 }
+
                 if self.cgi_tasks.contains_key(&fd) {
                     continue;
                 }
@@ -164,12 +188,19 @@ impl HttpServer {
                 let wants_write = self
                     .clients
                     .get(&fd)
-                    .map(|c| c.write_pos < c.write_buf.len())
+                    .map(|client| client.write_pos < client.write_buf.len())
                     .unwrap_or(false);
                 if wants_write && flags & libc::EPOLLOUT as u32 != 0 {
                     self.write_once(fd);
                 } else if flags & libc::EPOLLIN as u32 != 0 {
                     self.read_once(fd);
+                } else if self
+                    .clients
+                    .get(&fd)
+                    .map(|client| client.peer_closed)
+                    .unwrap_or(false)
+                {
+                    self.finish_peer_eof(fd);
                 }
             }
 
@@ -185,7 +216,7 @@ impl HttpServer {
             None => return,
         };
         let (stream, _) = match accepted {
-            Ok(v) => v,
+            Ok(value) => value,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
             Err(err) => {
                 eprintln!("accept error: {err}");
@@ -198,7 +229,12 @@ impl HttpServer {
         }
         let _ = stream.set_nodelay(true);
         let fd = stream.as_raw_fd();
-        if let Err(err) = self.epoll_add(fd, (libc::EPOLLIN | libc::EPOLLRDHUP) as u32) {
+        let generation = self.allocate_generation();
+        if let Err(err) = self.epoll_add_client(
+            fd,
+            generation,
+            (libc::EPOLLIN | libc::EPOLLRDHUP) as u32,
+        ) {
             eprintln!("failed to register client: {err}");
             return;
         }
@@ -207,11 +243,13 @@ impl HttpServer {
             Client {
                 stream,
                 listener_fd,
+                generation,
                 read_buf: Vec::with_capacity(8192),
                 write_buf: Vec::new(),
                 write_pos: 0,
                 close_after_write: false,
-                processing: false,
+                peer_closed: false,
+                pending: None,
                 last_active: Instant::now(),
             },
         );
@@ -224,16 +262,63 @@ impl HttpServer {
             None => return,
         };
         match result {
-            Ok(0) => self.remove_client(fd),
-            Ok(n) => {
+            Ok(0) => {
                 if let Some(client) = self.clients.get_mut(&fd) {
-                    client.read_buf.extend_from_slice(&buf[..n]);
+                    client.peer_closed = true;
+                }
+                self.finish_peer_eof(fd);
+            }
+            Ok(count) => {
+                if let Some(client) = self.clients.get_mut(&fd) {
+                    client.read_buf.extend_from_slice(&buf[..count]);
                     client.last_active = Instant::now();
                 }
                 self.process_client_buffer(fd);
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
             Err(_) => self.remove_client(fd),
+        }
+    }
+
+    fn finish_peer_eof(&mut self, fd: RawFd) {
+        let idle = self
+            .clients
+            .get(&fd)
+            .map(|client| client.write_pos >= client.write_buf.len())
+            .unwrap_or(false)
+            && !self.cgi_tasks.contains_key(&fd);
+        if !idle {
+            return;
+        }
+
+        let has_input = self
+            .clients
+            .get(&fd)
+            .map(|client| !client.read_buf.is_empty() || client.pending.is_some())
+            .unwrap_or(false);
+        if !has_input {
+            self.remove_client(fd);
+            return;
+        }
+
+        self.process_client_buffer(fd);
+        if !self.clients.contains_key(&fd) {
+            return;
+        }
+        let still_idle = self
+            .clients
+            .get(&fd)
+            .map(|client| client.write_pos >= client.write_buf.len())
+            .unwrap_or(false)
+            && !self.cgi_tasks.contains_key(&fd);
+        if still_idle {
+            let server_index = self.default_server_for_client(fd).unwrap_or(0);
+            let server = self.configs.get(server_index).cloned();
+            let response = server
+                .as_ref()
+                .map(|config| self.error_response(config, 400, "incomplete request before EOF"))
+                .unwrap_or_else(|| cgi_error_response(400, "incomplete request before EOF"));
+            self.queue_response(fd, response, false);
         }
     }
 
@@ -248,17 +333,18 @@ impl HttpServer {
 
         match result {
             Ok(0) => self.remove_client(fd),
-            Ok(n) => {
+            Ok(count) => {
                 let mut finished = false;
                 let mut close = false;
                 let mut has_buffered_request = false;
                 if let Some(client) = self.clients.get_mut(&fd) {
-                    client.write_pos += n;
+                    client.write_pos += count;
                     client.last_active = Instant::now();
                     if client.write_pos >= client.write_buf.len() {
                         finished = true;
-                        close = client.close_after_write;
                         has_buffered_request = !client.read_buf.is_empty();
+                        close = client.close_after_write
+                            || (client.peer_closed && !has_buffered_request);
                         client.write_buf.clear();
                         client.write_pos = 0;
                         client.close_after_write = false;
@@ -287,76 +373,176 @@ impl HttpServer {
     }
 
     fn process_client_buffer(&mut self, fd: RawFd) {
-        let parsed = match self.clients.get(&fd) {
-            Some(client) => try_parse_request(&client.read_buf, MAX_HARD_REQUEST),
-            None => return,
-        };
-        match parsed {
-            ParseResult::NeedMore => {}
-            ParseResult::Error(message) => {
-                let server_index = self.default_server_for_client(fd).unwrap_or(0);
-                let server = self.configs.get(server_index).cloned();
-                let response = server
-                    .as_ref()
-                    .map(|s| self.error_response(s, 400, &message))
-                    .unwrap_or_else(|| cgi_error_response(400, &message));
-                self.queue_response(fd, response, false);
-            }
-            ParseResult::Complete {
-                mut request,
-                consumed,
-            } => {
-                if let Some(client) = self.clients.get_mut(&fd) {
-                    client.read_buf.drain(..consumed);
-                }
+        if !self.clients.contains_key(&fd) {
+            return;
+        }
 
-                let server_index = match self.resolve_server_for_request(fd, request.host()) {
-                    Some(index) => index,
-                    None => {
-                        self.remove_client(fd);
-                        return;
-                    }
-                };
-                let server = self.configs[server_index].clone();
-
-                if request.body.len() > server.client_max_body_size {
-                    let response =
-                        self.error_response(&server, 413, "request body exceeds configured limit");
-                    self.queue_response(fd, response, !request.wants_close());
+        let needs_head = self
+            .clients
+            .get(&fd)
+            .map(|client| client.pending.is_none())
+            .unwrap_or(false);
+        if needs_head {
+            let head_result = match self.clients.get(&fd) {
+                Some(client) => try_parse_request_head(&client.read_buf, MAX_HARD_REQUEST),
+                None => return,
+            };
+            let head = match head_result {
+                HeadParseResult::NeedMore => return,
+                HeadParseResult::Error(message) => {
+                    let server_index = self.default_server_for_client(fd).unwrap_or(0);
+                    let server = self.configs.get(server_index).cloned();
+                    let response = server
+                        .as_ref()
+                        .map(|config| self.error_response(config, 400, &message))
+                        .unwrap_or_else(|| cgi_error_response(400, &message));
+                    self.queue_response(fd, response, false);
                     return;
                 }
-
-                let normalized = match normalize_url_path(&request.path) {
-                    Ok(path) => path,
-                    Err(err) => {
-                        let response = self.error_response(&server, 400, &err);
-                        self.queue_response(fd, response, false);
-                        return;
-                    }
-                };
-                request.path = normalized.clone();
-
-                let route = match server.route_for(&normalized).cloned() {
-                    Some(route) => route,
-                    None => {
-                        let response = self.error_response(&server, 404, "no matching route");
-                        self.queue_response(fd, response, !request.wants_close());
-                        return;
-                    }
-                };
-
-                match self.build_action(server_index, &server, &route, request, &normalized) {
-                    RequestAction::Response(response, keep_alive) => {
-                        self.queue_response(fd, response, keep_alive)
-                    }
-                    RequestAction::Cgi {
-                        spec,
-                        request,
-                        keep_alive,
-                        server_index,
-                    } => self.start_cgi(fd, server_index, spec, request, keep_alive),
+                HeadParseResult::TooLarge(message) => {
+                    let server_index = self.default_server_for_client(fd).unwrap_or(0);
+                    let server = self.configs.get(server_index).cloned();
+                    let response = server
+                        .as_ref()
+                        .map(|config| self.error_response(config, 413, &message))
+                        .unwrap_or_else(|| cgi_error_response(413, &message));
+                    self.queue_response(fd, response, false);
+                    return;
                 }
+                HeadParseResult::Complete(head) => head,
+            };
+
+            let server_index = match self.resolve_server_for_request(fd, head.host()) {
+                Some(index) => index,
+                None => {
+                    self.remove_client(fd);
+                    return;
+                }
+            };
+            let body_limit = self.configs[server_index].client_max_body_size;
+            if head
+                .content_length()
+                .map(|length| length > body_limit)
+                .unwrap_or(false)
+            {
+                let server = self.configs[server_index].clone();
+                let response =
+                    self.error_response(&server, 413, "request body exceeds configured limit");
+                self.queue_response(fd, response, false);
+                return;
             }
+
+            if let Some(client) = self.clients.get_mut(&fd) {
+                client.pending = Some(PendingRequest {
+                    head,
+                    server_index,
+                    chunk_progress: ChunkProgress::default(),
+                });
+            } else {
+                return;
+            }
+        }
+
+        let (server_index, body_limit) = match self.clients.get(&fd) {
+            Some(client) => match client.pending.as_ref() {
+                Some(pending) => (
+                    pending.server_index,
+                    self.configs[pending.server_index].client_max_body_size,
+                ),
+                None => return,
+            },
+            None => return,
+        };
+
+        let body_result = {
+            let Some(client) = self.clients.get_mut(&fd) else {
+                return;
+            };
+            let Some(pending) = client.pending.as_mut() else {
+                return;
+            };
+            try_parse_request_body(
+                &client.read_buf,
+                &pending.head,
+                MAX_HARD_REQUEST,
+                body_limit,
+                &mut pending.chunk_progress,
+            )
+        };
+
+        let (body, consumed) = match body_result {
+            BodyParseResult::NeedMore => return,
+            BodyParseResult::Error(message) => {
+                if let Some(client) = self.clients.get_mut(&fd) {
+                    client.pending = None;
+                }
+                let server = self.configs[server_index].clone();
+                let response = self.error_response(&server, 400, &message);
+                self.queue_response(fd, response, false);
+                return;
+            }
+            BodyParseResult::TooLarge(message) => {
+                if let Some(client) = self.clients.get_mut(&fd) {
+                    client.pending = None;
+                }
+                let server = self.configs[server_index].clone();
+                let response = self.error_response(&server, 413, &message);
+                self.queue_response(fd, response, false);
+                return;
+            }
+            BodyParseResult::Complete { body, consumed } => (body, consumed),
+        };
+
+        let buffered_len = self
+            .clients
+            .get(&fd)
+            .map(|client| client.read_buf.len())
+            .unwrap_or(0);
+        if consumed > buffered_len {
+            self.remove_client(fd);
+            return;
+        }
+        let mut request = {
+            let Some(client) = self.clients.get_mut(&fd) else {
+                return;
+            };
+            let Some(pending) = client.pending.take() else {
+                return;
+            };
+            client.read_buf.drain(..consumed);
+            pending.head.into_request(body)
+        };
+
+        let server = self.configs[server_index].clone();
+        let normalized = match normalize_url_path(&request.path) {
+            Ok(path) => path,
+            Err(err) => {
+                let response = self.error_response(&server, 400, &err);
+                self.queue_response(fd, response, false);
+                return;
+            }
+        };
+        request.path = normalized.clone();
+
+        let route = match server.route_for(&normalized).cloned() {
+            Some(route) => route,
+            None => {
+                let response = self.error_response(&server, 404, "no matching route");
+                self.queue_response(fd, response, !request.wants_close());
+                return;
+            }
+        };
+
+        match self.build_action(server_index, &server, &route, request, &normalized) {
+            RequestAction::Response(response, keep_alive) => {
+                self.queue_response(fd, response, keep_alive)
+            }
+            RequestAction::Cgi {
+                spec,
+                request,
+                keep_alive,
+                server_index,
+            } => self.start_cgi(fd, server_index, spec, request, keep_alive),
         }
     }
 
@@ -369,7 +555,7 @@ impl HttpServer {
         normalized_path: &str,
     ) -> RequestAction {
         let keep_alive = !request.wants_close();
-        if !route.methods.iter().any(|m| m == &request.method) {
+        if !route.methods.iter().any(|method| method == &request.method) {
             let mut response =
                 self.error_response(server, 405, "method is not allowed for this route");
             response
@@ -430,11 +616,6 @@ impl HttpServer {
         match request.method.as_str() {
             "GET" => RequestAction::Response(
                 self.handle_get(server, route, normalized_path),
-                keep_alive,
-            ),
-            "POST" => RequestAction::Response(
-                Response::new(200, request.body)
-                    .header("Content-Type", "application/octet-stream"),
                 keep_alive,
             ),
             "DELETE" => RequestAction::Response(
@@ -508,7 +689,7 @@ impl HttpServer {
 
         if request
             .header("content-type")
-            .map(|v| v.to_ascii_lowercase().starts_with("multipart/form-data"))
+            .map(|value| value.to_ascii_lowercase().starts_with("multipart/form-data"))
             .unwrap_or(false)
         {
             match parse_multipart_file(request) {
@@ -607,9 +788,9 @@ impl HttpServer {
             return None;
         }
         let relative = route_relative(route, path);
-        let segments: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
+        let segments: Vec<&str> = relative.split('/').filter(|segment| !segment.is_empty()).collect();
         let mut script_parts = Vec::new();
-        for (idx, segment) in segments.iter().enumerate() {
+        for (index, segment) in segments.iter().enumerate() {
             script_parts.push(*segment);
             let lower = segment.to_ascii_lowercase();
             if let Some(mapping) = route
@@ -619,8 +800,8 @@ impl HttpServer {
             {
                 let script_rel = script_parts.join("/");
                 let script = safe_join(&route.root, &script_rel).ok()?;
-                let path_info = if idx + 1 < segments.len() {
-                    format!("/{}", segments[idx + 1..].join("/"))
+                let path_info = if index + 1 < segments.len() {
+                    format!("/{}", segments[index + 1..].join("/"))
                 } else {
                     String::new()
                 };
@@ -663,7 +844,6 @@ impl HttpServer {
         ) {
             Ok(task) => {
                 if let Some(client) = self.clients.get_mut(&fd) {
-                    client.processing = true;
                     client.last_active = Instant::now();
                 }
                 if self.modify_interest(fd, libc::EPOLLRDHUP as u32).is_err() {
@@ -719,7 +899,6 @@ impl HttpServer {
                 continue;
             }
             if let Some(client) = self.clients.get_mut(&fd) {
-                client.processing = false;
                 client.last_active = Instant::now();
             }
             let server = self.configs[server_index].clone();
@@ -759,10 +938,16 @@ impl HttpServer {
     }
 
     fn queue_response(&mut self, fd: RawFd, response: Response, keep_alive: bool) {
+        let effective_keep_alive = match self.clients.get(&fd) {
+            Some(client) => {
+                keep_alive && (!client.peer_closed || !client.read_buf.is_empty())
+            }
+            None => return,
+        };
         if let Some(client) = self.clients.get_mut(&fd) {
-            client.write_buf = response.to_bytes(keep_alive);
+            client.write_buf = response.to_bytes(effective_keep_alive);
             client.write_pos = 0;
-            client.close_after_write = !keep_alive;
+            client.close_after_write = !effective_keep_alive;
             client.last_active = Instant::now();
         } else {
             return;
@@ -780,8 +965,8 @@ impl HttpServer {
         let listener = self.listeners.get(&client.listener_fd)?;
         let host = host_without_port(host_header).to_ascii_lowercase();
         for index in &listener.server_indices {
-            let cfg = self.configs.get(*index)?;
-            if cfg
+            let config = self.configs.get(*index)?;
+            if config
                 .server_names
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case(&host))
@@ -837,25 +1022,51 @@ impl HttpServer {
         self.clients.remove(&fd);
     }
 
-    fn epoll_add(&self, fd: RawFd, events: u32) -> io::Result<()> {
-        let mut event = libc::epoll_event {
-            events,
-            u64: fd as u64,
-        };
-        let rc = unsafe { libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_ADD, fd, &mut event) };
-        if rc < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+    fn allocate_generation(&mut self) -> u32 {
+        loop {
+            self.next_generation = self.next_generation.wrapping_add(1);
+            if self.next_generation != 0 {
+                return self.next_generation;
+            }
         }
     }
 
-    fn modify_interest(&self, fd: RawFd, events: u32) -> io::Result<()> {
-        let mut event = libc::epoll_event {
+    fn epoll_add_listener(&self, fd: RawFd, events: u32) -> io::Result<()> {
+        self.epoll_ctl_with_token(libc::EPOLL_CTL_ADD, fd, events, event_token(fd, 0))
+    }
+
+    fn epoll_add_client(&self, fd: RawFd, generation: u32, events: u32) -> io::Result<()> {
+        self.epoll_ctl_with_token(
+            libc::EPOLL_CTL_ADD,
+            fd,
             events,
-            u64: fd as u64,
-        };
-        let rc = unsafe { libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_MOD, fd, &mut event) };
+            event_token(fd, generation),
+        )
+    }
+
+    fn modify_interest(&self, fd: RawFd, events: u32) -> io::Result<()> {
+        let generation = self
+            .clients
+            .get(&fd)
+            .map(|client| client.generation)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "client no longer exists"))?;
+        self.epoll_ctl_with_token(
+            libc::EPOLL_CTL_MOD,
+            fd,
+            events,
+            event_token(fd, generation),
+        )
+    }
+
+    fn epoll_ctl_with_token(
+        &self,
+        operation: i32,
+        fd: RawFd,
+        events: u32,
+        token: u64,
+    ) -> io::Result<()> {
+        let mut event = libc::epoll_event { events, u64: token };
+        let rc = unsafe { libc::epoll_ctl(self.epoll_fd, operation, fd, &mut event) };
         if rc < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -874,6 +1085,18 @@ impl Drop for HttpServer {
             libc::close(self.epoll_fd);
         }
     }
+}
+
+fn event_token(fd: RawFd, generation: u32) -> u64 {
+    ((generation as u64) << 32) | (fd as u32 as u64)
+}
+
+fn token_fd(token: u64) -> RawFd {
+    token as u32 as RawFd
+}
+
+fn token_generation(token: u64) -> u32 {
+    (token >> 32) as u32
 }
 
 fn route_relative<'a>(route: &RouteConfig, path: &'a str) -> &'a str {
@@ -918,11 +1141,11 @@ fn directory_listing(dir: &Path, request_path: &str) -> io::Result<String> {
 
 fn url_path_escape(input: &str) -> String {
     let mut out = String::new();
-    for b in input.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            out.push_str(&format!("%{byte:02X}"));
         }
     }
     out
@@ -936,8 +1159,8 @@ fn parse_multipart_file(request: &Request) -> Result<(String, Vec<u8>), String> 
         .split(';')
         .map(str::trim)
         .find_map(|part| part.strip_prefix("boundary="))
-        .map(|v| v.trim_matches('"'))
-        .filter(|v| !v.is_empty())
+        .map(|value| value.trim_matches('"'))
+        .filter(|value| !value.is_empty())
         .ok_or_else(|| "multipart boundary is missing".to_string())?;
     let marker = format!("--{boundary}").into_bytes();
     let mut pos = 0usize;
@@ -988,6 +1211,9 @@ fn multipart_filename(headers: &str) -> Option<String> {
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
@@ -1061,6 +1287,14 @@ mod tests {
     }
 
     #[test]
+    fn event_tokens_distinguish_reused_file_descriptors() {
+        let fd = 42;
+        assert_ne!(event_token(fd, 1), event_token(fd, 2));
+        assert_eq!(token_fd(event_token(fd, 9)), fd);
+        assert_eq!(token_generation(event_token(fd, 9)), 9);
+    }
+
+    #[test]
     fn extracts_multipart_file() {
         let boundary = "abc123";
         let body = format!(
@@ -1072,7 +1306,7 @@ mod tests {
             "content-type".into(),
             format!("multipart/form-data; boundary={boundary}"),
         );
-        let req = Request {
+        let request = Request {
             method: "POST".into(),
             target: "/uploads".into(),
             path: "/uploads".into(),
@@ -1081,7 +1315,7 @@ mod tests {
             headers,
             body,
         };
-        let (name, bytes) = parse_multipart_file(&req).unwrap();
+        let (name, bytes) = parse_multipart_file(&request).unwrap();
         assert_eq!(name, "hello.txt");
         assert_eq!(bytes, b"hello");
     }
