@@ -146,6 +146,24 @@ def run(binary: Path):
         status, _, body = request("GET", "/uploads/chunked.txt")
         check("chunked body decoded", status == 200 and body == b"Wikipedia")
 
+        pipelined = raw_http(
+            b"POST /uploads/pipelined.txt HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Content-Type: text/plain\r\n\r\n"
+            b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"
+            b"GET /uploads/pipelined.txt HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        check(
+            "chunked request preserves pipelined GET",
+            pipelined.startswith(b"HTTP/1.1 201")
+            and pipelined.count(b"HTTP/1.1 ") == 2
+            and b"HTTP/1.1 200 OK" in pipelined
+            and pipelined.endswith(b"Wikipedia"),
+        )
+
         status, headers, body = request("GET", "/session?user=Auditor")
         cookie = headers.get("Set-Cookie", "").split(";", 1)[0]
         check("session creates cookie", status == 200 and cookie.startswith("session_id="))
