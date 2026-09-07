@@ -177,15 +177,16 @@ fn decode_chunked(input: &[u8], hard_limit: usize) -> Result<Option<(Vec<u8>, us
         pos = line_end + 2;
 
         if size == 0 {
+            // An empty trailer section is exactly one CRLF. Check it before
+            // searching for CRLFCRLF so a pipelined request cannot be mistaken
+            // for trailers merely because its headers end with CRLFCRLF.
+            if input.get(pos..pos + 2) == Some(b"\r\n") {
+                pos += 2;
+                return Ok(Some((out, pos)));
+            }
             let trailer_end = match find_bytes(&input[pos..], b"\r\n\r\n") {
                 Some(v) => pos + v + 4,
-                None => {
-                    if input.get(pos..pos + 2) == Some(b"\r\n") {
-                        pos += 2;
-                        return Ok(Some((out, pos)));
-                    }
-                    return Ok(None);
-                }
+                None => return Ok(None),
             };
             return Ok(Some((out, trailer_end)));
         }
@@ -337,6 +338,26 @@ mod tests {
         let raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
         match try_parse_request(raw, 1024) {
             ParseResult::Complete { request, .. } => assert_eq!(request.body, b"Wikipedia"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserves_pipelined_request_after_empty_chunk_trailers() {
+        let first = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n";
+        let second = b"GET /next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        let mut raw = Vec::from(first.as_slice());
+        raw.extend_from_slice(second);
+
+        match try_parse_request(&raw, 4096) {
+            ParseResult::Complete {
+                request,
+                consumed,
+            } => {
+                assert_eq!(request.body, b"Wiki");
+                assert_eq!(consumed, first.len());
+                assert_eq!(&raw[consumed..], second);
+            }
             other => panic!("unexpected result: {other:?}"),
         }
     }
