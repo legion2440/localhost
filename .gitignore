@@ -1,0 +1,6 @@
+/target/
+/bonus_cpp/localhost_cpp
+*.log
+*.tmp
+public/uploads/*
+!public/uploads/.gitkeep
