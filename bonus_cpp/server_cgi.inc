@@ -60,6 +60,12 @@
         std::string path_info;
     };
 
+    enum class CgiFinishKind {
+        Success,
+        Timeout,
+        Failed,
+    };
+
     std::optional<CgiSpec> find_cgi(const Route& route, const std::string& path) const {
         if (route.cgi.empty()) {
             return std::nullopt;
@@ -107,33 +113,37 @@
             return;
         }
 
-        const std::string base = "/tmp/localhost-cpp-cgi-" + std::to_string(getpid()) + "-"
-            + std::to_string(fd) + "-" + std::to_string(++seq);
-        const std::string input_path = base + ".in";
-        const std::string output_path = base + ".out";
-        {
-            std::ofstream file(input_path, std::ios::binary);
-            file.write(request.body.data(), static_cast<std::streamsize>(request.body.size()));
+        int sockets[2] = {-1, -1};
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) < 0) {
+            queue(fd, error(cfg[server_index], 500, "socketpair failed"), keep_alive);
+            return;
+        }
+        const int flags = fcntl(sockets[0], F_GETFL, 0);
+        if (flags < 0 || fcntl(sockets[0], F_SETFL, flags | O_NONBLOCK) < 0) {
+            close(sockets[0]);
+            close(sockets[1]);
+            queue(fd, error(cfg[server_index], 500, "cannot make CGI channel nonblocking"), keep_alive);
+            return;
         }
 
         const pid_t pid = fork();
         if (pid < 0) {
+            close(sockets[0]);
+            close(sockets[1]);
             queue(fd, error(cfg[server_index], 500, "fork failed"), keep_alive);
             return;
         }
         if (pid == 0) {
-            const int input_fd = open(input_path.c_str(), O_RDONLY);
-            const int output_fd = open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-            if (input_fd < 0 || output_fd < 0) {
+            close(sockets[0]);
+            if (dup2(sockets[1], STDIN_FILENO) < 0 || dup2(sockets[1], STDOUT_FILENO) < 0) {
                 _exit(127);
             }
-            if (dup2(input_fd, STDIN_FILENO) < 0 || dup2(output_fd, STDOUT_FILENO) < 0) {
-                _exit(127);
-            }
-            close(input_fd);
-            close(output_fd);
+            close(sockets[1]);
 
             const fs::path absolute = fs::absolute(spec.script);
+            setenv("GATEWAY_INTERFACE", "CGI/1.1", 1);
+            setenv("SERVER_PROTOCOL", request.version.c_str(), 1);
+            setenv("SERVER_SOFTWARE", "localhost-cpp/0.1", 1);
             setenv("REQUEST_METHOD", request.method.c_str(), 1);
             setenv("QUERY_STRING", request.query.c_str(), 1);
             setenv("PATH_INFO", spec.path_info.c_str(), 1);
@@ -152,17 +162,49 @@
             _exit(127);
         }
 
+        close(sockets[1]);
+        CgiTask task;
+        task.server_index = server_index;
+        task.pid = pid;
+        task.io_fd = sockets[0];
+        task.io_generation = allocate_generation();
+        task.input = request.body;
+        task.keep_alive = keep_alive;
+        task.started = Clock::now();
+        if (task.input.empty()) {
+            if (shutdown(task.io_fd, SHUT_WR) < 0 && errno != ENOTCONN) {
+                kill(pid, SIGKILL);
+                waitpid(pid, nullptr, 0);
+                close(task.io_fd);
+                queue(fd, error(cfg[server_index], 500, "cannot close CGI stdin"), keep_alive);
+                return;
+            }
+            task.input_closed = true;
+        }
+
+        uint32_t interests = EPOLLIN | EPOLLRDHUP;
+        if (!task.input_closed) {
+            interests |= EPOLLOUT;
+        }
         try {
+            ctl(
+                EPOLL_CTL_ADD,
+                task.io_fd,
+                interests,
+                event_token(task.io_fd, task.io_generation)
+            );
             modify_interest(fd, EPOLLRDHUP);
         } catch (...) {
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, task.io_fd, nullptr);
             kill(pid, SIGKILL);
             waitpid(pid, nullptr, 0);
-            unlink(input_path.c_str());
-            unlink(output_path.c_str());
+            close(task.io_fd);
             remove(fd);
             return;
         }
-        cgis[fd] = {server_index, pid, input_path, output_path, keep_alive, Clock::now()};
+
+        cgi_io[task.io_fd] = {fd, task.io_generation};
+        cgis[fd] = std::move(task);
     }
 
     Response parse_cgi(const std::vector<char>& bytes) const {
@@ -205,6 +247,89 @@
         return response;
     }
 
+    void handle_cgi_io(int io_fd, uint32_t flags) {
+        const auto map_it = cgi_io.find(io_fd);
+        if (map_it == cgi_io.end()) {
+            return;
+        }
+        const int client_fd = map_it->second.client_fd;
+        auto task_it = cgis.find(client_fd);
+        if (task_it == cgis.end()) {
+            return;
+        }
+        CgiTask& task = task_it->second;
+
+        if ((flags & EPOLLERR) != 0) {
+            finish_cgi(client_fd, CgiFinishKind::Failed, "CGI channel error");
+            return;
+        }
+
+        if ((flags & EPOLLIN) != 0 ||
+            (((flags & (EPOLLRDHUP | EPOLLHUP)) != 0) && (flags & EPOLLOUT) == 0)) {
+            char buffer[65536];
+            const ssize_t count = recv(io_fd, buffer, sizeof(buffer), 0);
+            if (count > 0) {
+                task.output.insert(task.output.end(), buffer, buffer + count);
+                if (task.output.size() > MAX_CGI_OUTPUT) {
+                    finish_cgi(client_fd, CgiFinishKind::Failed, "CGI output too large");
+                    return;
+                }
+            } else if (count == 0) {
+                task.io_eof = true;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                finish_cgi(client_fd, CgiFinishKind::Failed, "CGI read failed");
+                return;
+            }
+        } else if (!task.input_closed && (flags & EPOLLOUT) != 0) {
+            const ssize_t count = send(
+                io_fd,
+                task.input.data() + static_cast<std::ptrdiff_t>(task.input_pos),
+                task.input.size() - task.input_pos,
+                MSG_NOSIGNAL
+            );
+            if (count > 0) {
+                task.input_pos += static_cast<size_t>(count);
+                if (task.input_pos == task.input.size()) {
+                    if (shutdown(io_fd, SHUT_WR) < 0 && errno != ENOTCONN) {
+                        finish_cgi(client_fd, CgiFinishKind::Failed, "CGI stdin shutdown failed");
+                        return;
+                    }
+                    task.input_closed = true;
+                }
+            } else if (count == 0) {
+                finish_cgi(client_fd, CgiFinishKind::Failed, "CGI stdin closed early");
+                return;
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                finish_cgi(client_fd, CgiFinishKind::Failed, "CGI write failed");
+                return;
+            }
+        }
+
+        task_it = cgis.find(client_fd);
+        if (task_it == cgis.end()) {
+            return;
+        }
+        uint32_t interests = EPOLLIN | EPOLLRDHUP;
+        if (!task_it->second.input_closed) {
+            interests |= EPOLLOUT;
+        }
+        try {
+            ctl(
+                EPOLL_CTL_MOD,
+                io_fd,
+                interests,
+                event_token(io_fd, task_it->second.io_generation)
+            );
+        } catch (...) {
+            finish_cgi(client_fd, CgiFinishKind::Failed, "cannot update CGI epoll interest");
+            return;
+        }
+
+        if (task_it->second.io_eof && task_it->second.process_exited) {
+            finish_cgi(client_fd, CgiFinishKind::Success, "");
+        }
+    }
+
     void poll_cgi() {
         std::vector<int> fds;
         for (const auto& [fd, task] : cgis) {
@@ -218,36 +343,69 @@
                 continue;
             }
             CgiTask& task = it->second;
-            int status = 0;
-            pid_t result = waitpid(task.pid, &status, WNOHANG);
-            const bool timeout = Clock::now() - task.started > std::chrono::seconds(5);
-            if (result == 0 && !timeout) {
-                continue;
-            }
-            if (timeout && result == 0) {
+            if (Clock::now() - task.started > std::chrono::seconds(5)) {
                 kill(task.pid, SIGKILL);
-                waitpid(task.pid, &status, 0);
+                waitpid(task.pid, nullptr, 0);
+                task.process_exited = true;
+                finish_cgi(fd, CgiFinishKind::Timeout, "CGI timeout");
+                continue;
             }
-
-            const CgiTask finished = task;
-            cgis.erase(it);
-            const std::vector<char> output = read_file(finished.out_path);
-            unlink(finished.in_path.c_str());
-            unlink(finished.out_path.c_str());
-            if (clients.count(fd) == 0) {
+            if (task.process_exited) {
+                if (task.io_eof) {
+                    finish_cgi(fd, CgiFinishKind::Success, "");
+                }
                 continue;
             }
 
-            Response response;
-            if (timeout) {
-                response = error(cfg[finished.server_index], 504, "CGI timeout");
-            } else if (result < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                response = error(cfg[finished.server_index], 502, "CGI failed");
-            } else {
-                response = parse_cgi(output);
+            int status = 0;
+            const pid_t result = waitpid(task.pid, &status, WNOHANG);
+            if (result == 0) {
+                continue;
             }
-            queue(fd, response, finished.keep_alive);
+            if (result < 0) {
+                finish_cgi(fd, CgiFinishKind::Failed, "waitpid failed");
+                continue;
+            }
+            if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                task.process_exited = true;
+                finish_cgi(fd, CgiFinishKind::Failed, "CGI failed");
+                continue;
+            }
+            task.process_exited = true;
+            if (task.io_eof) {
+                finish_cgi(fd, CgiFinishKind::Success, "");
+            }
         }
+    }
+
+    void finish_cgi(int client_fd, CgiFinishKind kind, const std::string& message) {
+        auto it = cgis.find(client_fd);
+        if (it == cgis.end()) {
+            return;
+        }
+        CgiTask task = std::move(it->second);
+        cgis.erase(it);
+        cgi_io.erase(task.io_fd);
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, task.io_fd, nullptr);
+
+        if (!task.process_exited) {
+            kill(task.pid, SIGKILL);
+            waitpid(task.pid, nullptr, 0);
+        }
+        close(task.io_fd);
+        if (clients.count(client_fd) == 0) {
+            return;
+        }
+
+        Response response;
+        if (kind == CgiFinishKind::Timeout) {
+            response = error(cfg[task.server_index], 504, "CGI timeout");
+        } else if (kind == CgiFinishKind::Failed) {
+            response = error(cfg[task.server_index], 502, message.empty() ? "CGI failed" : message);
+        } else {
+            response = parse_cgi(task.output);
+        }
+        queue(client_fd, response, task.keep_alive);
     }
 
     void queue(int fd, const Response& response, bool keep_alive) {
@@ -291,11 +449,13 @@
     void remove(int fd) {
         const auto cgi_it = cgis.find(fd);
         if (cgi_it != cgis.end()) {
-            kill(cgi_it->second.pid, SIGKILL);
-            waitpid(cgi_it->second.pid, nullptr, 0);
-            unlink(cgi_it->second.in_path.c_str());
-            unlink(cgi_it->second.out_path.c_str());
+            CgiTask task = std::move(cgi_it->second);
             cgis.erase(cgi_it);
+            cgi_io.erase(task.io_fd);
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, task.io_fd, nullptr);
+            kill(task.pid, SIGKILL);
+            waitpid(task.pid, nullptr, 0);
+            close(task.io_fd);
         }
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
         close(fd);

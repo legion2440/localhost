@@ -61,6 +61,46 @@ def make_config() -> Path:
     return Path(name)
 
 
+def check_conflicting_server_names(binary: Path):
+    conflict = """
+server {
+    listen 127.0.0.1:19080
+    server_name duplicate.test
+    location / {
+        root ./public
+    }
+}
+server {
+    listen 127.0.0.1:19080
+    server_name duplicate.test
+    location / {
+        root ./public_alt
+    }
+}
+"""
+    fd, name = tempfile.mkstemp(prefix="localhost-conflict-", suffix=".conf")
+    os.close(fd)
+    path = Path(name)
+    path.write_text(conflict)
+    try:
+        result = subprocess.run(
+            [str(binary), "--check-config", "-c", str(path)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        check(
+            "duplicate server_name on shared listener is detected",
+            result.returncode == 0
+            and "1 valid server block" in result.stdout
+            and "duplicate server_name" in result.stderr,
+        )
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def wait_ready(proc: subprocess.Popen):
     deadline = time.time() + 8
     while time.time() < deadline:
@@ -77,6 +117,8 @@ def wait_ready(proc: subprocess.Popen):
 
 
 def run(binary: Path):
+    check_conflicting_server_names(binary)
+
     uploads = ROOT / "public" / "uploads"
     uploads.mkdir(parents=True, exist_ok=True)
     for child in uploads.iterdir():
@@ -97,6 +139,13 @@ def run(binary: Path):
         status, headers, body = request("GET", "/")
         check("GET static index", status == 200 and b"Localhost Web Server" in body)
         check("response has Content-Length", "Content-Length" in headers)
+        check("response has Date", headers.get("Date", "").endswith("GMT"))
+
+        http_10 = raw_http(b"GET / HTTP/1.0\r\n\r\n")
+        check(
+            "HTTP/1.0 request is accepted",
+            http_10.startswith(b"HTTP/1.1 200") and b"Localhost Web Server" in http_10,
+        )
 
         half_closed = raw_http(
             b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -216,6 +265,18 @@ def run(binary: Path):
             b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
         )
         check("Python CGI chunked POST", cgi_chunked.startswith(b"HTTP/1.1 200") and b"hello world" in cgi_chunked)
+
+        cgi_large = b"x" * (256 * 1024)
+        status, _, body = request(
+            "POST",
+            "/cgi-bin/test.py/large-pipe",
+            cgi_large,
+            {"Content-Type": "text/plain"},
+        )
+        check(
+            "CGI streams body larger than pipe capacity",
+            status == 200 and cgi_large in body,
+        )
 
         if shutil.which("php-cgi"):
             status, _, body = request("GET", "/cgi-bin/test.php/bonus?name=Auditor")

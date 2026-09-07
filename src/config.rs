@@ -78,7 +78,16 @@ pub fn parse_config(text: &str) -> Result<Vec<ServerConfig>, String> {
     let mut errors = Vec::new();
     for (idx, raw) in raw_servers.into_iter().enumerate() {
         match parse_server(raw) {
-            Ok(server) => valid.push(server),
+            Ok(server) => {
+                if let Some(conflict) = valid
+                    .iter()
+                    .find_map(|existing| server_conflict(existing, &server))
+                {
+                    errors.push(format!("server #{} skipped: {conflict}", idx + 1));
+                } else {
+                    valid.push(server);
+                }
+            }
             Err(err) => errors.push(format!("server #{} skipped: {err}", idx + 1)),
         }
     }
@@ -93,9 +102,31 @@ pub fn parse_config(text: &str) -> Result<Vec<ServerConfig>, String> {
     Ok(valid)
 }
 
+fn server_conflict(existing: &ServerConfig, candidate: &ServerConfig) -> Option<String> {
+    for addr in existing
+        .listens
+        .iter()
+        .filter(|addr| candidate.listens.contains(addr))
+    {
+        if existing.server_names.is_empty() && candidate.server_names.is_empty() {
+            return Some(format!(
+                "duplicate unnamed/default server on shared listener {addr}"
+            ));
+        }
+        if let Some(name) = candidate
+            .server_names
+            .iter()
+            .find(|name| existing.server_names.iter().any(|current| current == *name))
+        {
+            return Some(format!(
+                "duplicate server_name `{name}` on shared listener {addr}"
+            ));
+        }
+    }
+    None
+}
+
 fn clean_line(line: &str) -> String {
-    // Comments are not required by the subject, but accepting them makes the
-    // supplied audit configuration friendlier without affecting the grammar.
     line.split('#').next().unwrap_or("").trim().to_string()
 }
 
@@ -130,7 +161,9 @@ fn split_server_blocks(text: &str) -> Result<Vec<RawServer>, String> {
         }
         if depth == 0 {
             in_server = false;
-            blocks.push(RawServer { lines: current.clone() });
+            blocks.push(RawServer {
+                lines: current.clone(),
+            });
             current.clear();
         } else {
             current.push(line);
@@ -147,6 +180,7 @@ fn parse_server(raw: RawServer) -> Result<ServerConfig, String> {
     let mut listens = Vec::new();
     let mut seen_listens = HashSet::new();
     let mut server_names = Vec::new();
+    let mut seen_server_names = HashSet::new();
     let mut client_max_body_size = 1024 * 1024;
     let mut error_pages = HashMap::new();
     let mut routes = Vec::new();
@@ -157,7 +191,6 @@ fn parse_server(raw: RawServer) -> Result<ServerConfig, String> {
         if line.starts_with("location ") && line.ends_with('{') {
             let path = line
                 .trim_end_matches('{')
-                .trim()
                 .split_whitespace()
                 .nth(1)
                 .ok_or_else(|| "invalid location declaration".to_string())?;
@@ -206,7 +239,13 @@ fn parse_server(raw: RawServer) -> Result<ServerConfig, String> {
                 if parts.len() < 2 {
                     return Err("server_name needs at least one name".into());
                 }
-                server_names.extend(parts[1..].iter().map(|s| s.to_ascii_lowercase()));
+                for name in &parts[1..] {
+                    let normalized = name.to_ascii_lowercase();
+                    if !seen_server_names.insert(normalized.clone()) {
+                        return Err(format!("duplicate server_name `{normalized}` in one server"));
+                    }
+                    server_names.push(normalized);
+                }
             }
             "client_max_body_size" => {
                 if parts.len() != 2 {
@@ -235,7 +274,7 @@ fn parse_server(raw: RawServer) -> Result<ServerConfig, String> {
     if routes.is_empty() {
         return Err("server has no locations".into());
     }
-    if !routes.iter().any(|r| r.path == "/") {
+    if !routes.iter().any(|route| route.path == "/") {
         return Err("server needs a `/` location".into());
     }
 
@@ -266,7 +305,10 @@ fn parse_route(path: &str, lines: &[String]) -> Result<RouteConfig, String> {
                 if parts.len() < 2 {
                     return Err(format!("location {path}: methods list is empty"));
                 }
-                methods = parts[1..].iter().map(|m| m.to_ascii_uppercase()).collect();
+                methods = parts[1..]
+                    .iter()
+                    .map(|method| method.to_ascii_uppercase())
+                    .collect();
             }
             "root" => {
                 if parts.len() != 2 {
@@ -402,5 +444,47 @@ mod tests {
         }
         "#;
         assert_eq!(parse_config(cfg).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn skips_duplicate_server_name_on_shared_listener() {
+        let cfg = r#"
+        server {
+            listen 127.0.0.1:8080
+            server_name same.test
+            location / {
+                root ./a
+            }
+        }
+        server {
+            listen 127.0.0.1:8080
+            server_name same.test
+            location / {
+                root ./b
+            }
+        }
+        "#;
+        let servers = parse_config(cfg).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].server_names, vec!["same.test"]);
+    }
+
+    #[test]
+    fn skips_duplicate_unnamed_server_on_shared_listener() {
+        let cfg = r#"
+        server {
+            listen 127.0.0.1:8080
+            location / {
+                root ./a
+            }
+        }
+        server {
+            listen 127.0.0.1:8080
+            location / {
+                root ./b
+            }
+        }
+        "#;
+        assert_eq!(parse_config(cfg).unwrap().len(), 1);
     }
 }

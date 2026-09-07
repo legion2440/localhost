@@ -19,12 +19,16 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+          rustup component add clippy
+
+      - name: Rust clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Rust unit tests
-        run: cargo test
+        run: RUSTFLAGS="-D warnings" cargo test
 
       - name: Build Rust server
-        run: cargo build --release
+        run: RUSTFLAGS="-D warnings" cargo build --release
 
       - name: Rust black-box suite
         run: python3 tests/audit.py target/release/localhost

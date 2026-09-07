@@ -1,8 +1,5 @@
 mod cgi;
 mod config;
-// `http` also exposes a whole-request convenience parser used by unit tests;
-// the server itself uses the incremental head/body API.
-#[allow(dead_code)]
 mod http;
 mod server;
 mod util;

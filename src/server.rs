@@ -1,4 +1,6 @@
-use crate::cgi::{cgi_error_response, parse_cgi_output, spawn_cgi, CgiSpec, CgiTask};
+use crate::cgi::{
+    cgi_error_response, parse_cgi_output, spawn_cgi, CgiLaunch, CgiSpec, CgiTask,
+};
 use crate::config::{RouteConfig, ServerConfig};
 use crate::http::{
     mime_type, try_parse_request_body, try_parse_request_head, BodyParseResult, ChunkProgress,
@@ -10,10 +12,12 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 const MAX_HARD_REQUEST: usize = 32 * 1024 * 1024;
+const MAX_CGI_OUTPUT: usize = 32 * 1024 * 1024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_EVENTS: usize = 128;
 
@@ -48,11 +52,16 @@ struct Session {
     last_seen: Instant,
 }
 
+struct CgiIoEntry {
+    client_fd: RawFd,
+    generation: u32,
+}
+
 enum RequestAction {
     Response(Response, bool),
     Cgi {
         spec: CgiSpec,
-        request: Request,
+        request: Box<Request>,
         keep_alive: bool,
         server_index: usize,
     },
@@ -64,6 +73,7 @@ pub struct HttpServer {
     listeners: HashMap<RawFd, ListenerEntry>,
     clients: HashMap<RawFd, Client>,
     cgi_tasks: HashMap<RawFd, CgiTask>,
+    cgi_io: HashMap<RawFd, CgiIoEntry>,
     sessions: HashMap<String, Session>,
     session_seq: u64,
     next_generation: u32,
@@ -81,6 +91,7 @@ impl HttpServer {
             listeners: HashMap::new(),
             clients: HashMap::new(),
             cgi_tasks: HashMap::new(),
+            cgi_io: HashMap::new(),
             sessions: HashMap::new(),
             session_seq: 0,
             next_generation: 0,
@@ -150,63 +161,108 @@ impl HttpServer {
                 return Err(err);
             }
 
-            self.poll_cgi_tasks();
-
+            self.guard_maintenance();
             for event in events.iter().take(count as usize) {
                 let token = event.u64;
-                let fd = token_fd(token);
-                let generation = token_generation(token);
                 let flags = event.events;
-
-                if generation == 0 {
-                    if self.listeners.contains_key(&fd) {
-                        self.accept_once(fd);
-                    }
-                    continue;
-                }
-
-                let current_generation = self.clients.get(&fd).map(|client| client.generation);
-                if current_generation != Some(generation) {
-                    continue;
-                }
-
-                if flags & libc::EPOLLERR as u32 != 0 {
-                    self.remove_client(fd);
-                    continue;
-                }
-
-                if flags & (libc::EPOLLRDHUP | libc::EPOLLHUP) as u32 != 0 {
-                    if let Some(client) = self.clients.get_mut(&fd) {
-                        client.peer_closed = true;
-                    }
-                }
-
-                if self.cgi_tasks.contains_key(&fd) {
-                    continue;
-                }
-
-                let wants_write = self
-                    .clients
-                    .get(&fd)
-                    .map(|client| client.write_pos < client.write_buf.len())
-                    .unwrap_or(false);
-                if wants_write && flags & libc::EPOLLOUT as u32 != 0 {
-                    self.write_once(fd);
-                } else if flags & libc::EPOLLIN as u32 != 0 {
-                    self.read_once(fd);
-                } else if self
-                    .clients
-                    .get(&fd)
-                    .map(|client| client.peer_closed)
-                    .unwrap_or(false)
-                {
-                    self.finish_peer_eof(fd);
+                if catch_unwind(AssertUnwindSafe(|| self.handle_epoll_event(token, flags))).is_err() {
+                    eprintln!("recovered from panic while handling epoll event");
+                    self.recover_event(token);
                 }
             }
+            self.guard_maintenance();
+        }
+    }
 
+    fn guard_maintenance(&mut self) {
+        if catch_unwind(AssertUnwindSafe(|| {
             self.poll_cgi_tasks();
             self.expire_clients();
             self.expire_sessions();
+        }))
+        .is_err()
+        {
+            eprintln!("recovered from panic during server maintenance");
+        }
+    }
+
+    fn handle_epoll_event(&mut self, token: u64, flags: u32) {
+        let fd = token_fd(token);
+        let generation = token_generation(token);
+
+        if generation == 0 {
+            if self.listeners.contains_key(&fd) {
+                self.accept_once(fd);
+            }
+            return;
+        }
+
+        if self
+            .cgi_io
+            .get(&fd)
+            .map(|entry| entry.generation == generation)
+            .unwrap_or(false)
+        {
+            self.handle_cgi_io(fd, flags);
+            return;
+        }
+
+        let current_generation = self.clients.get(&fd).map(|client| client.generation);
+        if current_generation != Some(generation) {
+            return;
+        }
+
+        if flags & libc::EPOLLERR as u32 != 0 {
+            self.remove_client(fd);
+            return;
+        }
+
+        if flags & (libc::EPOLLRDHUP | libc::EPOLLHUP) as u32 != 0 {
+            if let Some(client) = self.clients.get_mut(&fd) {
+                client.peer_closed = true;
+            }
+        }
+
+        if self.cgi_tasks.contains_key(&fd) {
+            return;
+        }
+
+        let wants_write = self
+            .clients
+            .get(&fd)
+            .map(|client| client.write_pos < client.write_buf.len())
+            .unwrap_or(false);
+        if wants_write && flags & libc::EPOLLOUT as u32 != 0 {
+            self.write_once(fd);
+        } else if flags & libc::EPOLLIN as u32 != 0 {
+            self.read_once(fd);
+        } else if self
+            .clients
+            .get(&fd)
+            .map(|client| client.peer_closed)
+            .unwrap_or(false)
+        {
+            self.finish_peer_eof(fd);
+        }
+    }
+
+    fn recover_event(&mut self, token: u64) {
+        let fd = token_fd(token);
+        let generation = token_generation(token);
+        if let Some(entry) = self.cgi_io.get(&fd) {
+            if entry.generation == generation {
+                let client_fd = entry.client_fd;
+                self.remove_client(client_fd);
+            }
+            return;
+        }
+        if self
+            .clients
+            .get(&fd)
+            .map(|client| client.generation == generation)
+            .unwrap_or(false)
+        {
+            self.remove_client(fd);
         }
     }
 
@@ -579,7 +635,7 @@ impl HttpServer {
             }
             return RequestAction::Cgi {
                 spec,
-                request,
+                request: Box::new(request),
                 keep_alive,
                 server_index,
             };
@@ -820,7 +876,7 @@ impl HttpServer {
         fd: RawFd,
         server_index: usize,
         spec: CgiSpec,
-        request: Request,
+        request: Box<Request>,
         keep_alive: bool,
     ) {
         let port = self
@@ -829,31 +885,56 @@ impl HttpServer {
             .and_then(|client| self.listeners.get(&client.listener_fd))
             .map(|listener| listener.addr.port())
             .unwrap_or(0);
-        match spawn_cgi(
-            fd,
+        let launch = CgiLaunch {
+            client_fd: fd,
             server_index,
-            &spec,
-            &request.method,
-            &request.query,
-            request.header("content-type"),
-            request.header("cookie"),
-            request.host(),
-            port,
-            &request.body,
+            spec: &spec,
+            request: &request,
+            server_port: port,
             keep_alive,
-        ) {
-            Ok(task) => {
-                if let Some(client) = self.clients.get_mut(&fd) {
-                    client.last_active = Instant::now();
+        };
+        match spawn_cgi(launch) {
+            Ok(mut task) => {
+                let io_fd = task.io_fd();
+                let io_generation = self.allocate_generation();
+                task.io_generation = io_generation;
+                let mut interests = (libc::EPOLLIN | libc::EPOLLRDHUP) as u32;
+                if task.wants_write() {
+                    interests |= libc::EPOLLOUT as u32;
                 }
-                if self.modify_interest(fd, libc::EPOLLRDHUP as u32).is_err() {
-                    let mut task = task;
+                if self
+                    .epoll_ctl_with_token(
+                        libc::EPOLL_CTL_ADD,
+                        io_fd,
+                        interests,
+                        event_token(io_fd, io_generation),
+                    )
+                    .is_err()
+                    || self.modify_interest(fd, libc::EPOLLRDHUP as u32).is_err()
+                {
                     let _ = task.child.kill();
                     let _ = task.child.wait();
-                    task.cleanup_files();
+                    unsafe {
+                        libc::epoll_ctl(
+                            self.epoll_fd,
+                            libc::EPOLL_CTL_DEL,
+                            io_fd,
+                            std::ptr::null_mut(),
+                        );
+                    }
                     self.remove_client(fd);
                     return;
                 }
+                if let Some(client) = self.clients.get_mut(&fd) {
+                    client.last_active = Instant::now();
+                }
+                self.cgi_io.insert(
+                    io_fd,
+                    CgiIoEntry {
+                        client_fd: fd,
+                        generation: io_generation,
+                    },
+                );
                 self.cgi_tasks.insert(fd, task);
             }
             Err(err) => {
@@ -862,6 +943,91 @@ impl HttpServer {
                     self.error_response(&server, 500, &format!("cannot start CGI: {err}"));
                 self.queue_response(fd, response, keep_alive);
             }
+        }
+    }
+
+    fn handle_cgi_io(&mut self, io_fd: RawFd, flags: u32) {
+        let client_fd = match self.cgi_io.get(&io_fd) {
+            Some(entry) => entry.client_fd,
+            None => return,
+        };
+        if flags & libc::EPOLLERR as u32 != 0 {
+            self.finish_cgi(client_fd, CgiFinish::Failed("CGI pipe error".into()));
+            return;
+        }
+
+        let wants_write = self
+            .cgi_tasks
+            .get(&client_fd)
+            .map(CgiTask::wants_write)
+            .unwrap_or(false);
+        let operation = if flags & libc::EPOLLIN as u32 != 0 {
+            CgiIoOperation::Read
+        } else if wants_write && flags & libc::EPOLLOUT as u32 != 0 {
+            CgiIoOperation::Write
+        } else if flags & (libc::EPOLLRDHUP | libc::EPOLLHUP) as u32 != 0 {
+            CgiIoOperation::Read
+        } else {
+            return;
+        };
+
+        let result = match self.cgi_tasks.get_mut(&client_fd) {
+            Some(task) => match operation {
+                CgiIoOperation::Read => task.read_once(),
+                CgiIoOperation::Write => task.write_once(),
+            },
+            None => return,
+        };
+        if let Err(err) = result {
+            self.finish_cgi(
+                client_fd,
+                CgiFinish::Failed(format!("CGI stream I/O failed: {err}")),
+            );
+            return;
+        }
+
+        if self
+            .cgi_tasks
+            .get(&client_fd)
+            .map(|task| task.output.len() > MAX_CGI_OUTPUT)
+            .unwrap_or(false)
+        {
+            self.finish_cgi(client_fd, CgiFinish::Failed("CGI output too large".into()));
+            return;
+        }
+
+        let interests = self.cgi_tasks.get(&client_fd).map(|task| {
+            let mut value = (libc::EPOLLIN | libc::EPOLLRDHUP) as u32;
+            if task.wants_write() {
+                value |= libc::EPOLLOUT as u32;
+            }
+            value
+        });
+        if let Some(interests) = interests {
+            if self
+                .epoll_ctl_with_token(
+                    libc::EPOLL_CTL_MOD,
+                    io_fd,
+                    interests,
+                    event_token(
+                        io_fd,
+                        self.cgi_tasks[&client_fd].io_generation,
+                    ),
+                )
+                .is_err()
+            {
+                self.finish_cgi(client_fd, CgiFinish::Failed("cannot update CGI epoll interest".into()));
+                return;
+            }
+        }
+
+        let ready = self
+            .cgi_tasks
+            .get(&client_fd)
+            .map(|task| task.io_eof && task.process_exited)
+            .unwrap_or(false);
+        if ready {
+            self.finish_cgi(client_fd, CgiFinish::Success);
         }
     }
 
@@ -875,45 +1041,70 @@ impl HttpServer {
                 if task.timed_out() {
                     let _ = task.child.kill();
                     let _ = task.child.wait();
-                    Some((false, true, task.server_index, task.keep_alive))
-                } else {
+                    Some(CgiFinish::Timeout)
+                } else if !task.process_exited {
                     match task.child.try_wait() {
-                        Ok(Some(status)) => {
-                            Some((status.success(), false, task.server_index, task.keep_alive))
+                        Ok(Some(status)) if status.success() => {
+                            task.process_exited = true;
+                            if task.io_eof {
+                                Some(CgiFinish::Success)
+                            } else {
+                                None
+                            }
                         }
+                        Ok(Some(_)) => Some(CgiFinish::Failed(
+                            "CGI process exited unsuccessfully".into(),
+                        )),
                         Ok(None) => None,
-                        Err(_) => Some((false, false, task.server_index, task.keep_alive)),
+                        Err(err) => Some(CgiFinish::Failed(format!(
+                            "cannot wait for CGI process: {err}"
+                        ))),
                     }
+                } else if task.io_eof {
+                    Some(CgiFinish::Success)
+                } else {
+                    None
                 }
             };
-            let Some((success, timeout, server_index, keep_alive)) = outcome else {
-                continue;
-            };
-            let task = match self.cgi_tasks.remove(&fd) {
-                Some(task) => task,
-                None => continue,
-            };
-            let output = fs::read(&task.output_path).unwrap_or_default();
-            task.cleanup_files();
-            if !self.clients.contains_key(&fd) {
-                continue;
+            if let Some(outcome) = outcome {
+                self.finish_cgi(fd, outcome);
             }
-            if let Some(client) = self.clients.get_mut(&fd) {
-                client.last_active = Instant::now();
-            }
-            let server = self.configs[server_index].clone();
-            let response = if timeout {
-                self.error_response(&server, 504, "CGI execution timed out")
-            } else if !success {
-                self.error_response(&server, 502, "CGI process exited unsuccessfully")
-            } else {
-                match parse_cgi_output(&output) {
-                    Ok(response) => response,
-                    Err(err) => self.error_response(&server, 502, &err),
-                }
-            };
-            self.queue_response(fd, response, keep_alive);
         }
+    }
+
+    fn finish_cgi(&mut self, client_fd: RawFd, outcome: CgiFinish) {
+        let mut task = match self.cgi_tasks.remove(&client_fd) {
+            Some(task) => task,
+            None => return,
+        };
+        let io_fd = task.io_fd();
+        self.cgi_io.remove(&io_fd);
+        unsafe {
+            libc::epoll_ctl(
+                self.epoll_fd,
+                libc::EPOLL_CTL_DEL,
+                io_fd,
+                std::ptr::null_mut(),
+            );
+        }
+        if !task.process_exited {
+            let _ = task.child.kill();
+            let _ = task.child.wait();
+        }
+        if !self.clients.contains_key(&client_fd) {
+            return;
+        }
+
+        let server = self.configs[task.server_index].clone();
+        let response = match outcome {
+            CgiFinish::Success => match parse_cgi_output(&task.output) {
+                Ok(response) => response,
+                Err(err) => self.error_response(&server, 502, &err),
+            },
+            CgiFinish::Timeout => self.error_response(&server, 504, "CGI execution timed out"),
+            CgiFinish::Failed(message) => self.error_response(&server, 502, &message),
+        };
+        self.queue_response(client_fd, response, task.keep_alive);
     }
 
     fn error_response(&self, server: &ServerConfig, status: u16, message: &str) -> Response {
@@ -939,9 +1130,7 @@ impl HttpServer {
 
     fn queue_response(&mut self, fd: RawFd, response: Response, keep_alive: bool) {
         let effective_keep_alive = match self.clients.get(&fd) {
-            Some(client) => {
-                keep_alive && (!client.peer_closed || !client.read_buf.is_empty())
-            }
+            Some(client) => keep_alive && (!client.peer_closed || !client.read_buf.is_empty()),
             None => return,
         };
         if let Some(client) = self.clients.get_mut(&fd) {
@@ -1007,9 +1196,18 @@ impl HttpServer {
 
     fn remove_client(&mut self, fd: RawFd) {
         if let Some(mut task) = self.cgi_tasks.remove(&fd) {
+            let io_fd = task.io_fd();
+            self.cgi_io.remove(&io_fd);
+            unsafe {
+                libc::epoll_ctl(
+                    self.epoll_fd,
+                    libc::EPOLL_CTL_DEL,
+                    io_fd,
+                    std::ptr::null_mut(),
+                );
+            }
             let _ = task.child.kill();
             let _ = task.child.wait();
-            task.cleanup_files();
         }
         unsafe {
             libc::epoll_ctl(
@@ -1073,6 +1271,18 @@ impl HttpServer {
             Ok(())
         }
     }
+}
+
+#[derive(Debug)]
+enum CgiFinish {
+    Success,
+    Timeout,
+    Failed(String),
+}
+
+enum CgiIoOperation {
+    Read,
+    Write,
 }
 
 impl Drop for HttpServer {

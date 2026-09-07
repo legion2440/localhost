@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -33,6 +34,7 @@ namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
 static constexpr size_t HARD_LIMIT = 32u * 1024u * 1024u;
+static constexpr size_t MAX_CGI_OUTPUT = 32u * 1024u * 1024u;
 static constexpr int MAX_EVENTS = 128;
 static const auto CLIENT_TIMEOUT = std::chrono::seconds(15);
 
@@ -133,10 +135,21 @@ struct Session {
 struct CgiTask {
     size_t server_index = 0;
     pid_t pid = -1;
-    std::string in_path;
-    std::string out_path;
+    int io_fd = -1;
+    uint32_t io_generation = 0;
+    std::vector<char> input;
+    size_t input_pos = 0;
+    std::vector<char> output;
+    bool input_closed = false;
+    bool io_eof = false;
+    bool process_exited = false;
     bool keep_alive = true;
     Clock::time_point started = Clock::now();
+};
+
+struct CgiIoEntry {
+    int client_fd = -1;
+    uint32_t generation = 0;
 };
 
 static std::string trim(std::string value) {
@@ -190,7 +203,11 @@ std::string Request::header(const std::string& name) const {
 }
 
 bool Request::close_requested() const {
-    return lower(header("connection")) == "close";
+    const std::string connection = lower(header("connection"));
+    if (version == "HTTP/1.0") {
+        return connection != "keep-alive";
+    }
+    return connection == "close";
 }
 
 std::string RequestHead::header(const std::string& name) const {
@@ -311,6 +328,7 @@ static Route parse_route(const std::string& path, const std::vector<std::string>
 static ServerConfig parse_server(const std::vector<std::string>& lines) {
     ServerConfig server;
     std::set<std::string> listens;
+    std::set<std::string> names;
 
     for (size_t i = 0; i < lines.size();) {
         const std::string line = lines[i];
@@ -352,7 +370,11 @@ static ServerConfig parse_server(const std::vector<std::string>& lines) {
             server.listens.push_back({parts[1].substr(0, colon), std::stoi(parts[1].substr(colon + 1))});
         } else if (parts[0] == "server_name" && parts.size() >= 2) {
             for (size_t j = 1; j < parts.size(); ++j) {
-                server.names.push_back(lower(parts[j]));
+                const std::string name = lower(parts[j]);
+                if (!names.insert(name).second) {
+                    throw std::runtime_error("duplicate server_name in one server: " + name);
+                }
+                server.names.push_back(name);
             }
         } else if (parts[0] == "client_max_body_size" && parts.size() == 2) {
             server.body_limit = parse_size(parts[1]);
@@ -370,6 +392,29 @@ static ServerConfig parse_server(const std::vector<std::string>& lines) {
     return server;
 }
 
+static std::optional<std::string> server_conflict(
+    const ServerConfig& existing,
+    const ServerConfig& candidate
+) {
+    for (const auto& address : existing.listens) {
+        if (std::find(candidate.listens.begin(), candidate.listens.end(), address)
+            == candidate.listens.end()) {
+            continue;
+        }
+        if (existing.names.empty() && candidate.names.empty()) {
+            return "duplicate unnamed/default server on shared listener "
+                + address.first + ":" + std::to_string(address.second);
+        }
+        for (const auto& name : candidate.names) {
+            if (std::find(existing.names.begin(), existing.names.end(), name) != existing.names.end()) {
+                return "duplicate server_name `" + name + "` on shared listener "
+                    + address.first + ":" + std::to_string(address.second);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 static std::vector<ServerConfig> load_config(const std::string& path) {
     std::ifstream file(path);
     if (!file) {
@@ -381,7 +426,20 @@ static std::vector<ServerConfig> load_config(const std::string& path) {
     std::vector<ServerConfig> output;
     for (size_t i = 0; i < blocks.size(); ++i) {
         try {
-            output.push_back(parse_server(blocks[i]));
+            ServerConfig candidate = parse_server(blocks[i]);
+            std::optional<std::string> conflict;
+            for (const auto& existing : output) {
+                conflict = server_conflict(existing, candidate);
+                if (conflict) {
+                    break;
+                }
+            }
+            if (conflict) {
+                std::cerr << "config warning: server #" << i + 1
+                          << " skipped: " << *conflict << "\n";
+            } else {
+                output.push_back(std::move(candidate));
+            }
         } catch (const std::exception& error) {
             std::cerr << "config warning: server #" << i + 1 << " skipped: " << error.what() << "\n";
         }

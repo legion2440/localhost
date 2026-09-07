@@ -24,12 +24,12 @@ impl Request {
     }
 
     pub fn wants_close(&self) -> bool {
-        if self.version != "HTTP/1.1" || self.target.is_empty() {
-            return true;
+        let connection = self.header("connection").unwrap_or("");
+        match self.version.as_str() {
+            "HTTP/1.1" => connection.eq_ignore_ascii_case("close"),
+            "HTTP/1.0" => !connection.eq_ignore_ascii_case("keep-alive"),
+            _ => true,
         }
-        self.header("connection")
-            .map(|v| v.eq_ignore_ascii_case("close"))
-            .unwrap_or(false)
     }
 }
 
@@ -100,14 +100,6 @@ pub enum BodyParseResult {
     TooLarge(String),
 }
 
-#[derive(Debug)]
-pub enum ParseResult {
-    NeedMore,
-    Complete { request: Request, consumed: usize },
-    Error(String),
-    TooLarge(String),
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ChunkProgress {
     pos: usize,
@@ -153,8 +145,9 @@ pub fn try_parse_request_head(buffer: &[u8], hard_limit: usize) -> HeadParseResu
     {
         return HeadParseResult::Error("invalid HTTP method".into());
     }
-    if request_parts[2] != "HTTP/1.1" {
-        return HeadParseResult::Error("only HTTP/1.1 is supported".into());
+    let version = request_parts[2];
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return HeadParseResult::Error("unsupported HTTP version".into());
     }
 
     let target = request_parts[1].to_string();
@@ -192,7 +185,7 @@ pub fn try_parse_request_head(buffer: &[u8], hard_limit: usize) -> HeadParseResu
         headers.insert(name, value);
     }
 
-    if !headers.contains_key("host") {
+    if version == "HTTP/1.1" && !headers.contains_key("host") {
         return HeadParseResult::Error("HTTP/1.1 Host header is required".into());
     }
 
@@ -207,6 +200,9 @@ pub fn try_parse_request_head(buffer: &[u8], hard_limit: usize) -> HeadParseResu
     }
 
     if let Some(encoding) = transfer_encoding {
+        if version == "HTTP/1.0" {
+            return HeadParseResult::Error("Transfer-Encoding requires HTTP/1.1".into());
+        }
         if !encoding
             .split(',')
             .map(str::trim)
@@ -231,7 +227,7 @@ pub fn try_parse_request_head(buffer: &[u8], hard_limit: usize) -> HeadParseResu
         target,
         path: raw_path,
         query,
-        version: "HTTP/1.1".into(),
+        version: version.into(),
         headers,
         body_start,
     })
@@ -289,25 +285,6 @@ pub fn try_parse_request_body(
     BodyParseResult::Complete {
         body: Vec::new(),
         consumed: head.body_start,
-    }
-}
-
-pub fn try_parse_request(buffer: &[u8], hard_limit: usize) -> ParseResult {
-    let head = match try_parse_request_head(buffer, hard_limit) {
-        HeadParseResult::NeedMore => return ParseResult::NeedMore,
-        HeadParseResult::Error(error) => return ParseResult::Error(error),
-        HeadParseResult::TooLarge(error) => return ParseResult::TooLarge(error),
-        HeadParseResult::Complete(head) => head,
-    };
-    let mut progress = ChunkProgress::default();
-    match try_parse_request_body(buffer, &head, hard_limit, hard_limit, &mut progress) {
-        BodyParseResult::NeedMore => ParseResult::NeedMore,
-        BodyParseResult::Error(error) => ParseResult::Error(error),
-        BodyParseResult::TooLarge(error) => ParseResult::TooLarge(error),
-        BodyParseResult::Complete { body, consumed } => ParseResult::Complete {
-            request: head.into_request(body),
-            consumed,
-        },
     }
 }
 
@@ -468,6 +445,7 @@ impl Response {
         let mut has_length = false;
         let mut has_type = false;
         let mut has_connection = false;
+        let mut has_date = false;
         for (name, value) in &self.headers {
             if no_entity
                 && (name.eq_ignore_ascii_case("content-length")
@@ -481,6 +459,8 @@ impl Response {
                 has_type = true;
             } else if name.eq_ignore_ascii_case("connection") {
                 has_connection = true;
+            } else if name.eq_ignore_ascii_case("date") {
+                has_date = true;
             }
             out.extend_from_slice(name.as_bytes());
             out.extend_from_slice(b": ");
@@ -492,6 +472,9 @@ impl Response {
         }
         if !no_entity && !has_length {
             out.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
+        }
+        if !has_date {
+            out.extend_from_slice(format!("Date: {}\r\n", http_date()).as_bytes());
         }
         if !has_connection {
             out.extend_from_slice(
@@ -508,6 +491,31 @@ impl Response {
         }
         out
     }
+}
+
+fn http_date() -> String {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut timestamp: libc::time_t = 0;
+    if unsafe { libc::time(&mut timestamp) } < 0 {
+        return "Thu, 01 Jan 1970 00:00:00 GMT".into();
+    }
+    let mut utc: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::gmtime_r(&timestamp, &mut utc) }.is_null() {
+        return "Thu, 01 Jan 1970 00:00:00 GMT".into();
+    }
+    let weekday = WEEKDAYS.get(utc.tm_wday as usize).copied().unwrap_or("Thu");
+    let month = MONTHS.get(utc.tm_mon as usize).copied().unwrap_or("Jan");
+    format!(
+        "{weekday}, {:02} {month} {:04} {:02}:{:02}:{:02} GMT",
+        utc.tm_mday,
+        utc.tm_year + 1900,
+        utc.tm_hour,
+        utc.tm_min,
+        utc.tm_sec
+    )
 }
 
 pub fn reason_phrase(status: u16) -> &'static str {
@@ -562,22 +570,30 @@ pub fn mime_type(path: &Path) -> &'static str {
 mod tests {
     use super::*;
 
+    fn parse_complete(raw: &[u8], hard_limit: usize, body_limit: usize) -> (Request, usize) {
+        let head = match try_parse_request_head(raw, hard_limit) {
+            HeadParseResult::Complete(head) => head,
+            other => panic!("unexpected head result: {other:?}"),
+        };
+        let mut progress = ChunkProgress::default();
+        match try_parse_request_body(raw, &head, hard_limit, body_limit, &mut progress) {
+            BodyParseResult::Complete { body, consumed } => (head.into_request(body), consumed),
+            other => panic!("unexpected body result: {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_content_length_request() {
         let raw = b"POST /api/echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
-        match try_parse_request(raw, 1024) {
-            ParseResult::Complete { request, .. } => assert_eq!(request.body, b"hello"),
-            other => panic!("unexpected result: {other:?}"),
-        }
+        let (request, _) = parse_complete(raw, 1024, 1024);
+        assert_eq!(request.body, b"hello");
     }
 
     #[test]
     fn parses_chunked_request() {
         let raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
-        match try_parse_request(raw, 1024) {
-            ParseResult::Complete { request, .. } => assert_eq!(request.body, b"Wikipedia"),
-            other => panic!("unexpected result: {other:?}"),
-        }
+        let (request, _) = parse_complete(raw, 1024, 1024);
+        assert_eq!(request.body, b"Wikipedia");
     }
 
     #[test]
@@ -586,27 +602,19 @@ mod tests {
         let second = b"GET /next HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
         let mut raw = Vec::from(first.as_slice());
         raw.extend_from_slice(second);
-
-        match try_parse_request(&raw, 4096) {
-            ParseResult::Complete {
-                request,
-                consumed,
-            } => {
-                assert_eq!(request.body, b"Wiki");
-                assert_eq!(consumed, first.len());
-                assert_eq!(&raw[consumed..], second);
-            }
-            other => panic!("unexpected result: {other:?}"),
-        }
+        let (request, consumed) = parse_complete(&raw, 4096, 4096);
+        assert_eq!(request.body, b"Wiki");
+        assert_eq!(consumed, first.len());
+        assert_eq!(&raw[consumed..], second);
     }
 
     #[test]
     fn rejects_conflicting_framing() {
         let raw = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n";
-        assert!(matches!(
-            try_parse_request(raw, 1024),
-            ParseResult::Error(_)
-        ));
+        match try_parse_request_head(raw, 1024) {
+            HeadParseResult::Error(message) => assert!(message.contains("cannot be combined")),
+            other => panic!("unexpected result: {other:?}"),
+        }
     }
 
     #[test]
@@ -617,10 +625,25 @@ mod tests {
             other => panic!("unexpected head result: {other:?}"),
         };
         let mut progress = ChunkProgress::default();
-        assert!(matches!(
-            try_parse_request_body(raw, &head, 4096, 8, &mut progress),
-            BodyParseResult::TooLarge(_)
-        ));
+        match try_parse_request_body(raw, &head, 4096, 8, &mut progress) {
+            BodyParseResult::TooLarge(message) => assert!(message.contains("configured limit")),
+            other => panic!("unexpected body result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_http_1_0_without_host() {
+        let raw = b"GET / HTTP/1.0\r\n\r\n";
+        let (request, _) = parse_complete(raw, 1024, 1024);
+        assert_eq!(request.version, "HTTP/1.0");
+        assert!(request.wants_close());
+    }
+
+    #[test]
+    fn serializes_date_header() {
+        let text = String::from_utf8(Response::new(200, "ok").to_bytes(false)).unwrap();
+        assert!(text.contains("\r\nDate: "));
+        assert!(text.contains(" GMT\r\n"));
     }
 
     #[test]

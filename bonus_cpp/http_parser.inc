@@ -48,7 +48,7 @@ static HeadParseOut parse_request_head(const std::vector<char>& bytes) {
         line.pop_back();
     }
     const auto parts = split_ws(line);
-    if (parts.size() != 3 || parts[2] != "HTTP/1.1") {
+    if (parts.size() != 3 || (parts[2] != "HTTP/1.0" && parts[2] != "HTTP/1.1")) {
         output.kind = ParseKind::Error;
         output.error = "bad request line";
         return output;
@@ -114,7 +114,8 @@ static HeadParseOut parse_request_head(const std::vector<char>& bytes) {
         output.head.headers[key] = value;
     }
 
-    if (output.head.headers.find("host") == output.head.headers.end()) {
+    if (output.head.version == "HTTP/1.1"
+        && output.head.headers.find("host") == output.head.headers.end()) {
         output.kind = ParseKind::Error;
         output.error = "Host required";
         return output;
@@ -125,6 +126,11 @@ static HeadParseOut parse_request_head(const std::vector<char>& bytes) {
     if (!transfer_encoding.empty() && !content_length.empty()) {
         output.kind = ParseKind::Error;
         output.error = "conflicting framing";
+        return output;
+    }
+    if (!transfer_encoding.empty() && output.head.version == "HTTP/1.0") {
+        output.kind = ParseKind::Error;
+        output.error = "transfer-encoding requires HTTP/1.1";
         return output;
     }
     if (!transfer_encoding.empty() && !output.head.is_chunked()) {

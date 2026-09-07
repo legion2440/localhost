@@ -10,9 +10,13 @@ public:
     }
 
     ~App() {
-        for (auto& [fd, client] : clients) {
+        std::vector<int> client_fds;
+        for (const auto& [fd, client] : clients) {
             (void)client;
-            close(fd);
+            client_fds.push_back(fd);
+        }
+        for (int fd : client_fds) {
+            remove(fd);
         }
         for (auto& [fd, listener] : listeners) {
             (void)listener;
@@ -46,6 +50,12 @@ public:
                     if (listeners.count(fd) != 0) {
                         accept_one(fd);
                     }
+                    continue;
+                }
+
+                const auto cgi_io_it = cgi_io.find(fd);
+                if (cgi_io_it != cgi_io.end() && cgi_io_it->second.generation == generation) {
+                    handle_cgi_io(fd, flags);
                     continue;
                 }
 
@@ -87,6 +97,7 @@ private:
     std::unordered_map<int, Listener> listeners;
     std::unordered_map<int, Client> clients;
     std::unordered_map<int, CgiTask> cgis;
+    std::unordered_map<int, CgiIoEntry> cgi_io;
     std::unordered_map<std::string, Session> sessions;
     unsigned long long seq = 0;
     uint32_t next_generation = 0;

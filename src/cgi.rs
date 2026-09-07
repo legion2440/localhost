@@ -1,7 +1,9 @@
-use crate::http::{reason_phrase, Response};
-use crate::util::now_millis;
+use crate::http::{reason_phrase, Request, Response};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read, Write};
+use std::net::Shutdown;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -13,14 +15,29 @@ pub struct CgiSpec {
     pub path_info: String,
 }
 
+pub struct CgiLaunch<'a> {
+    pub client_fd: RawFd,
+    pub server_index: usize,
+    pub spec: &'a CgiSpec,
+    pub request: &'a Request,
+    pub server_port: u16,
+    pub keep_alive: bool,
+}
+
 pub struct CgiTask {
     pub server_index: usize,
     pub child: Child,
-    pub output_path: PathBuf,
-    pub input_path: PathBuf,
+    pub io: UnixStream,
+    pub input: Vec<u8>,
+    pub input_pos: usize,
+    pub output: Vec<u8>,
     pub started: Instant,
     pub timeout: Duration,
     pub keep_alive: bool,
+    pub io_generation: u32,
+    pub input_closed: bool,
+    pub io_eof: bool,
+    pub process_exited: bool,
 }
 
 impl CgiTask {
@@ -28,85 +45,124 @@ impl CgiTask {
         self.started.elapsed() >= self.timeout
     }
 
-    pub fn cleanup_files(&self) {
-        let _ = fs::remove_file(&self.input_path);
-        let _ = fs::remove_file(&self.output_path);
+    pub fn io_fd(&self) -> RawFd {
+        self.io.as_raw_fd()
+    }
+
+    pub fn wants_write(&self) -> bool {
+        !self.input_closed && self.input_pos < self.input.len()
+    }
+
+    pub fn close_input(&mut self) -> io::Result<()> {
+        if !self.input_closed {
+            self.io.shutdown(Shutdown::Write)?;
+            self.input_closed = true;
+        }
+        Ok(())
+    }
+
+    pub fn write_once(&mut self) -> io::Result<()> {
+        if !self.wants_write() {
+            self.close_input()?;
+            return Ok(());
+        }
+        match self.io.write(&self.input[self.input_pos..]) {
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "CGI stdin closed before request body was written",
+            )),
+            Ok(count) => {
+                self.input_pos += count;
+                if self.input_pos == self.input.len() {
+                    self.close_input()?;
+                }
+                Ok(())
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn read_once(&mut self) -> io::Result<()> {
+        let mut buffer = [0u8; 65536];
+        match self.io.read(&mut buffer) {
+            Ok(0) => {
+                self.io_eof = true;
+                Ok(())
+            }
+            Ok(count) => {
+                self.output.extend_from_slice(&buffer[..count]);
+                Ok(())
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 }
 
-pub fn spawn_cgi(
-    client_fd: i32,
-    server_index: usize,
-    spec: &CgiSpec,
-    method: &str,
-    query: &str,
-    content_type: Option<&str>,
-    cookie: Option<&str>,
-    host: &str,
-    server_port: u16,
-    body: &[u8],
-    keep_alive: bool,
-) -> io::Result<CgiTask> {
-    let nonce = now_millis();
-    let pid = std::process::id();
-    let tmp = std::env::temp_dir();
-    let input_path = tmp.join(format!("localhost-cgi-{pid}-{client_fd}-{nonce}.in"));
-    let output_path = tmp.join(format!("localhost-cgi-{pid}-{client_fd}-{nonce}.out"));
+pub fn spawn_cgi(launch: CgiLaunch<'_>) -> io::Result<CgiTask> {
+    let (parent_io, child_io) = UnixStream::pair()?;
+    parent_io.set_nonblocking(true)?;
 
-    fs::write(&input_path, body)?;
-    let input = File::open(&input_path)?;
-    let output = File::create(&output_path)?;
+    let child_stdin_socket = child_io.try_clone()?;
+    let child_stdin = unsafe { File::from_raw_fd(child_stdin_socket.into_raw_fd()) };
+    let child_stdout = unsafe { File::from_raw_fd(child_io.into_raw_fd()) };
 
-    let script_path = fs::canonicalize(&spec.script)
-        .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(&spec.script)))?;
+    let script_path = fs::canonicalize(&launch.spec.script)
+        .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(&launch.spec.script)))?;
     let parent = script_path.parent().unwrap_or_else(|| Path::new("."));
     let script_arg = script_path
         .file_name()
         .map(PathBuf::from)
         .unwrap_or_else(|| script_path.clone());
 
-    let mut cmd = Command::new(&spec.interpreter);
+    let request = launch.request;
+    let mut cmd = Command::new(&launch.spec.interpreter);
     cmd.arg(script_arg)
         .current_dir(parent)
-        .stdin(Stdio::from(input))
-        .stdout(Stdio::from(output))
+        .stdin(Stdio::from(child_stdin))
+        .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::null())
         .env("GATEWAY_INTERFACE", "CGI/1.1")
-        .env("SERVER_PROTOCOL", "HTTP/1.1")
+        .env("SERVER_PROTOCOL", &request.version)
         .env("SERVER_SOFTWARE", "localhost/0.1")
-        .env("REQUEST_METHOD", method)
-        .env("QUERY_STRING", query)
-        .env("PATH_INFO", &spec.path_info)
+        .env("REQUEST_METHOD", &request.method)
+        .env("REQUEST_URI", &request.target)
+        .env("QUERY_STRING", &request.query)
+        .env("PATH_INFO", &launch.spec.path_info)
         .env("SCRIPT_FILENAME", &script_path)
-        .env("SCRIPT_NAME", spec.script.to_string_lossy().as_ref())
-        .env("CONTENT_LENGTH", body.len().to_string())
-        .env("SERVER_PORT", server_port.to_string())
-        .env("HTTP_HOST", host);
-    if let Some(value) = content_type {
+        .env("SCRIPT_NAME", launch.spec.script.to_string_lossy().as_ref())
+        .env("CONTENT_LENGTH", request.body.len().to_string())
+        .env("SERVER_PORT", launch.server_port.to_string())
+        .env("HTTP_HOST", request.host());
+    if let Some(value) = request.header("content-type") {
         cmd.env("CONTENT_TYPE", value);
     }
-    if let Some(value) = cookie {
+    if let Some(value) = request.header("cookie") {
         cmd.env("HTTP_COOKIE", value);
     }
 
-    let child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            let _ = fs::remove_file(&input_path);
-            let _ = fs::remove_file(&output_path);
-            return Err(err);
-        }
-    };
-
-    Ok(CgiTask {
-        server_index,
+    let child = cmd.spawn()?;
+    let mut task = CgiTask {
+        server_index: launch.server_index,
         child,
-        output_path,
-        input_path,
+        io: parent_io,
+        input: request.body.clone(),
+        input_pos: 0,
+        output: Vec::new(),
         started: Instant::now(),
         timeout: Duration::from_secs(5),
-        keep_alive,
-    })
+        keep_alive: launch.keep_alive,
+        io_generation: 0,
+        input_closed: false,
+        io_eof: false,
+        process_exited: false,
+    };
+    if task.input.is_empty() {
+        task.close_input()?;
+    }
+    let _ = launch.client_fd;
+    Ok(task)
 }
 
 pub fn parse_cgi_output(bytes: &[u8]) -> Result<Response, String> {
@@ -131,7 +187,6 @@ pub fn parse_cgi_output(bytes: &[u8]) -> Result<Response, String> {
             .ok_or_else(|| format!("malformed CGI header `{line}`"))?;
         if name.eq_ignore_ascii_case("Status") {
             let code = value
-                .trim()
                 .split_whitespace()
                 .next()
                 .ok_or_else(|| "empty CGI Status header".to_string())?;
