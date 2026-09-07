@@ -37,9 +37,79 @@ function setupConsole() {
   }
 }
 
+function ensureMethodResult() {
+  let result = document.getElementById('method-result');
+  if (result) return result;
+
+  const postForm = document.getElementById('post-json-form');
+  if (!postForm) return null;
+
+  const wrapper = document.createElement('div');
+  wrapper.style.marginTop = '1rem';
+
+  const title = document.createElement('h4');
+  title.textContent = 'Last HTTP Response';
+
+  result = document.createElement('pre');
+  result.id = 'method-result';
+  result.className = 'code-box pre-wrap';
+  result.textContent = 'Run GET or POST to inspect the response here.';
+
+  wrapper.append(title, result);
+  postForm.insertAdjacentElement('afterend', wrapper);
+  return result;
+}
+
+function showMethodResponse(label, response, text) {
+  const result = ensureMethodResult();
+  if (!result) return;
+
+  const details = [
+    `${label}`,
+    `HTTP ${response.status} ${response.statusText}`,
+  ];
+  const contentType = response.headers.get('content-type');
+  const contentLength = response.headers.get('content-length');
+  if (contentType) details.push(`Content-Type: ${contentType}`);
+  if (contentLength) details.push(`Content-Length: ${contentLength}`);
+
+  const previewLimit = 800;
+  const preview = text.length > previewLimit
+    ? `${text.substring(0, previewLimit)}\n… (${text.length - previewLimit} more bytes)`
+    : text;
+
+  result.textContent = `${details.join('\n')}\n\n${preview}`;
+  result.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
 // 1. Setup GET and POST forms
 function setupForms() {
+  const getForm = document.getElementById('get-form');
   const postBtn = document.getElementById('btn-post-json');
+
+  ensureMethodResult();
+
+  if (getForm) {
+    getForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const params = new URLSearchParams(new FormData(getForm));
+      const target = `/?${params.toString()}`;
+      logToConsole(`Sending GET ${target}`, 'get');
+
+      try {
+        const response = await fetch(target, { method: 'GET', cache: 'no-store' });
+        const text = await response.text();
+        history.replaceState(null, '', target);
+        showMethodResponse(`GET ${target}`, response, text);
+        logToConsole(`GET Response HTTP ${response.status}: ${text.length} bytes`, response.ok ? 'get' : 'error');
+      } catch (err) {
+        const result = ensureMethodResult();
+        if (result) result.textContent = `GET ${target}\nRequest failed: ${err.message}`;
+        logToConsole(`GET Error: ${err.message}`, 'error');
+      }
+    });
+  }
+
   if (postBtn) {
     postBtn.addEventListener('click', async () => {
       const payload = document.getElementById('post-payload').value;
@@ -53,8 +123,11 @@ function setupForms() {
           body: payload
         });
         const text = await response.text();
+        showMethodResponse('POST /api/echo', response, text);
         logToConsole(`POST Response HTTP ${response.status}: ${text.substring(0, 100)}`, response.ok ? 'post' : 'error');
       } catch (err) {
+        const result = ensureMethodResult();
+        if (result) result.textContent = `POST /api/echo\nRequest failed: ${err.message}`;
         logToConsole(`POST Error: ${err.message}`, 'error');
       }
     });
