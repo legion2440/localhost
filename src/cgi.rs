@@ -14,7 +14,6 @@ pub struct CgiSpec {
 }
 
 pub struct CgiTask {
-    pub client_fd: i32,
     pub server_index: usize,
     pub child: Child,
     pub output_path: PathBuf,
@@ -100,7 +99,6 @@ pub fn spawn_cgi(
     };
 
     Ok(CgiTask {
-        client_fd,
         server_index,
         child,
         output_path,

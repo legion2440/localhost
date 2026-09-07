@@ -22,6 +22,9 @@ impl Request {
     }
 
     pub fn wants_close(&self) -> bool {
+        if self.version != "HTTP/1.1" || self.target.is_empty() {
+            return true;
+        }
         self.header("connection")
             .map(|v| v.eq_ignore_ascii_case("close"))
             .unwrap_or(false)
