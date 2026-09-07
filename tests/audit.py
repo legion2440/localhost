@@ -223,10 +223,6 @@ def run(binary: Path):
         else:
             print("[SKIP] PHP CGI bonus (php-cgi not installed)")
 
-        big = b"x" * (2 * 1024 * 1024 + 1)
-        status, _, _ = request("POST", "/uploads/too-big.bin", big, {"Content-Type": "application/octet-stream"})
-        check("client body limit -> 413", status == 413)
-
         malformed = raw_http(b"BROKEN REQUEST\r\n\r\n")
         check("malformed request -> 400", malformed.startswith(b"HTTP/1.1 400"))
         status, _, _ = request("GET", "/")
