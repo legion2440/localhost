@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install runtime test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y php-cgi
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Rust unit tests
+        run: cargo test
+
+      - name: Build Rust server
+        run: cargo build --release
+
+      - name: Rust black-box suite
+        run: python3 tests/audit.py target/release/localhost
+
+      - name: Build C++ bonus server
+        run: make -C bonus_cpp
+
+      - name: C++ black-box suite
+        run: python3 tests/audit.py bonus_cpp/localhost_cpp
