@@ -1,0 +1,5 @@
+#!/bin/sh
+# php-cgi enables cgi.force_redirect by default on Debian/Ubuntu.
+# A real CGI gateway supplies REDIRECT_STATUS; do the same here before exec.
+export REDIRECT_STATUS=1
+exec /usr/bin/php-cgi "$@"

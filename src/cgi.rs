@@ -58,12 +58,13 @@ pub fn spawn_cgi(
     let input = File::open(&input_path)?;
     let output = File::create(&output_path)?;
 
-    let parent = spec.script.parent().unwrap_or_else(|| Path::new("."));
-    let script_arg = spec
-        .script
+    let script_path = fs::canonicalize(&spec.script)
+        .or_else(|_| std::env::current_dir().map(|cwd| cwd.join(&spec.script)))?;
+    let parent = script_path.parent().unwrap_or_else(|| Path::new("."));
+    let script_arg = script_path
         .file_name()
         .map(PathBuf::from)
-        .unwrap_or_else(|| spec.script.clone());
+        .unwrap_or_else(|| script_path.clone());
 
     let mut cmd = Command::new(&spec.interpreter);
     cmd.arg(script_arg)
@@ -77,7 +78,7 @@ pub fn spawn_cgi(
         .env("REQUEST_METHOD", method)
         .env("QUERY_STRING", query)
         .env("PATH_INFO", &spec.path_info)
-        .env("SCRIPT_FILENAME", &spec.script)
+        .env("SCRIPT_FILENAME", &script_path)
         .env("SCRIPT_NAME", spec.script.to_string_lossy().as_ref())
         .env("CONTENT_LENGTH", body.len().to_string())
         .env("SERVER_PORT", server_port.to_string())

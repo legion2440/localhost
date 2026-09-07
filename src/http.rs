@@ -66,8 +66,8 @@ pub fn try_parse_request(buffer: &[u8], hard_limit: usize) -> ParseResult {
     }
     let target = request_parts[1].to_string();
     let (raw_path, query) = match target.split_once('?') {
-        Some((p, q)) => (p, q),
-        None => (target.as_str(), ""),
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target.clone(), String::new()),
     };
     if !raw_path.starts_with('/') {
         return ParseResult::Error("request target must use origin-form".into());
@@ -145,8 +145,8 @@ pub fn try_parse_request(buffer: &[u8], hard_limit: usize) -> ParseResult {
         request: Request {
             method,
             target,
-            path: raw_path.to_string(),
-            query: query.to_string(),
+            path: raw_path,
+            query,
             version: "HTTP/1.1".to_string(),
             headers,
             body,

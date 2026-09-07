@@ -4,8 +4,8 @@ TARGET := localhost_cpp
 
 all: $(TARGET)
 
-$(TARGET): main.cpp
-	$(CXX) $(CXXFLAGS) $< -o $@
+$(TARGET): main.cpp checked_syscalls.hpp
+	$(CXX) $(CXXFLAGS) -include checked_syscalls.hpp main.cpp -o $@
 
 clean:
 	rm -f $(TARGET)
