@@ -1,0 +1,340 @@
+// 01-Edu Localhost Server Suite Client Logic
+document.addEventListener('DOMContentLoaded', () => {
+  // Update client time clock
+  setInterval(() => {
+    const el = document.getElementById('client-time');
+    if (el) el.textContent = new Date().toLocaleTimeString();
+  }, 1000);
+
+  updateCookiesDisplay();
+  setupConsole();
+  setupForms();
+  setupUploads();
+  setupFileTable();
+  setupCookies();
+  setupCgi();
+});
+
+// Logging helper
+function logToConsole(message, type = 'system') {
+  const consoleBox = document.getElementById('http-console');
+  if (!consoleBox) return;
+  const time = new Date().toISOString().substring(11, 19);
+  const entry = document.createElement('div');
+  entry.className = `log-entry ${type}`;
+  entry.textContent = `[${time}] ${message}`;
+  consoleBox.appendChild(entry);
+  consoleBox.scrollTop = consoleBox.scrollHeight;
+}
+
+function setupConsole() {
+  const clearBtn = document.getElementById('btn-clear-console');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      const consoleBox = document.getElementById('http-console');
+      if (consoleBox) consoleBox.innerHTML = '';
+    });
+  }
+}
+
+// 1. Setup GET and POST forms
+function setupForms() {
+  const postBtn = document.getElementById('btn-post-json');
+  if (postBtn) {
+    postBtn.addEventListener('click', async () => {
+      const payload = document.getElementById('post-payload').value;
+      logToConsole(`Sending POST /api/echo with ${payload.length} bytes`, 'post');
+      try {
+        const response = await fetch('/api/echo', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: payload
+        });
+        const text = await response.text();
+        logToConsole(`POST Response HTTP ${response.status}: ${text.substring(0, 100)}`, response.ok ? 'post' : 'error');
+      } catch (err) {
+        logToConsole(`POST Error: ${err.message}`, 'error');
+      }
+    });
+  }
+}
+
+// 2. Setup Uploads (Multipart & Chunked)
+function setupUploads() {
+  const standardBtn = document.getElementById('btn-upload-standard');
+  const chunkedBtn = document.getElementById('btn-upload-chunked');
+  const fileInput = document.getElementById('file-input');
+  const dropZone = document.getElementById('drop-zone');
+
+  if (fileInput && dropZone) {
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length > 0) {
+        dropZone.querySelector('p').textContent = `Selected: ${fileInput.files[0].name} (${Math.round(fileInput.files[0].size / 1024)} KB)`;
+      }
+    });
+  }
+
+  if (standardBtn) {
+    standardBtn.addEventListener('click', async () => {
+      if (!fileInput || !fileInput.files.length) {
+        alert('Please choose a file to upload first.');
+        return;
+      }
+      const file = fileInput.files[0];
+      const formData = new FormData();
+      formData.append('file', file);
+
+      logToConsole(`Uploading ${file.name} (${file.size} bytes) via POST /uploads`, 'post');
+      try {
+        const res = await fetch('/uploads', {
+          method: 'POST',
+          body: formData
+        });
+        logToConsole(`Upload Response: HTTP ${res.status} ${res.statusText}`, res.ok ? 'post' : 'error');
+        if (res.ok) await refreshFiles();
+      } catch (err) {
+        logToConsole(`Upload failed: ${err.message}`, 'error');
+      }
+    });
+  }
+
+  if (chunkedBtn) {
+    chunkedBtn.addEventListener('click', async () => {
+      if (!fileInput || !fileInput.files.length) {
+        alert('Please choose a file to test chunked upload.');
+        return;
+      }
+      const file = fileInput.files[0];
+      logToConsole(`Sending Chunked Upload for ${file.name}...`, 'post');
+      
+      // A streaming Fetch body has no known Content-Length. On HTTP/1.1 Chromium sends it with chunked transfer coding; the browser owns the Transfer-Encoding header.
+      const reader = file.stream();
+      try {
+        const res = await fetch(`/uploads/${encodeURIComponent(file.name)}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': file.type || 'application/octet-stream',
+            'X-Filename': file.name
+          },
+          body: reader,
+          // @ts-ignore
+          duplex: 'half'
+        });
+        logToConsole(`Chunked Upload Response: HTTP ${res.status}`, res.ok ? 'post' : 'error');
+        if (res.ok) await refreshFiles();
+      } catch (err) {
+        logToConsole(`Chunked stream test note: ${err.message}`, 'error');
+      }
+    });
+  }
+}
+
+// Quick payload size tester for 413
+window.testPayloadSize = async function(kilobytes) {
+  const sizeBytes = kilobytes * 1024;
+  const chunk = 'A'.repeat(sizeBytes);
+  logToConsole(`Testing payload limit with ${kilobytes} KB data...`, 'post');
+  try {
+    const res = await fetch(`/uploads/payload-${kilobytes}kb.txt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: chunk
+    });
+    if (res.status === 413) {
+      logToConsole(`HTTP 413 Payload Too Large returned correctly! Server enforced client_max_body_size.`, 'post');
+    } else {
+      logToConsole(`Server response: HTTP ${res.status} ${res.statusText}`, 'post');
+    }
+  } catch (err) {
+    logToConsole(`Request error: ${err.message}`, 'error');
+  }
+};
+
+// 3. DELETE Method handling and live autoindex listing
+function setupFileTable() {
+  const tbody = document.getElementById('files-list');
+  const refreshBtn = document.getElementById('btn-refresh-files');
+
+  if (refreshBtn) refreshBtn.addEventListener('click', refreshFiles);
+  if (tbody) {
+    tbody.addEventListener('click', async (event) => {
+      const button = event.target.closest('.btn-delete-file');
+      if (!button) return;
+      const fileName = button.dataset.file;
+      if (!fileName || !confirm(`Execute HTTP DELETE on /uploads/${fileName}?`)) return;
+
+      const url = `/uploads/${encodeURIComponent(fileName)}`;
+      logToConsole(`Executing DELETE ${url}`, 'delete');
+      try {
+        const res = await fetch(url, { method: 'DELETE' });
+        logToConsole(`DELETE Response: HTTP ${res.status} ${res.statusText}`, res.ok ? 'delete' : 'error');
+        if (res.ok) await refreshFiles();
+      } catch (err) {
+        logToConsole(`DELETE failed: ${err.message}`, 'error');
+      }
+    });
+  }
+
+  refreshFiles();
+}
+
+async function refreshFiles() {
+  const tbody = document.getElementById('files-list');
+  if (!tbody) return;
+  tbody.replaceChildren();
+
+  try {
+    const res = await fetch('/uploads/', { cache: 'no-store' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const html = await res.text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const names = [...doc.querySelectorAll('a[href]')]
+      .map(anchor => anchor.textContent.trim().replace(/\/$/, ''))
+      .filter(name => name && name !== '..');
+
+    if (!names.length) {
+      const row = document.createElement('tr');
+      const cell = document.createElement('td');
+      cell.colSpan = 4;
+      cell.textContent = 'No uploaded files yet.';
+      row.appendChild(cell);
+      tbody.appendChild(row);
+      return;
+    }
+
+    names.forEach(name => addFileToTable(name));
+  } catch (err) {
+    const row = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.colSpan = 4;
+    cell.textContent = `Unable to load /uploads/: ${err.message}`;
+    row.appendChild(cell);
+    tbody.appendChild(row);
+  }
+}
+
+function addFileToTable(filename, size = null) {
+  const tbody = document.getElementById('files-list');
+  if (!tbody) return;
+
+  const tr = document.createElement('tr');
+  tr.dataset.file = filename;
+
+  const nameCell = document.createElement('td');
+  nameCell.textContent = filename;
+
+  const sizeCell = document.createElement('td');
+  sizeCell.textContent = Number.isFinite(size) ? `${(size / 1024).toFixed(1)} KB` : '—';
+
+  const url = `/uploads/${encodeURIComponent(filename)}`;
+  const pathCell = document.createElement('td');
+  const code = document.createElement('code');
+  code.textContent = url;
+  pathCell.appendChild(code);
+
+  const actionsCell = document.createElement('td');
+  const getLink = document.createElement('a');
+  getLink.href = url;
+  getLink.target = '_blank';
+  getLink.rel = 'noopener';
+  getLink.className = 'btn btn-xs btn-outline';
+  getLink.textContent = 'GET';
+
+  const deleteButton = document.createElement('button');
+  deleteButton.type = 'button';
+  deleteButton.className = 'btn btn-xs btn-danger btn-delete-file';
+  deleteButton.dataset.file = filename;
+  deleteButton.textContent = 'DELETE';
+
+  actionsCell.append(getLink, document.createTextNode(' '), deleteButton);
+  tr.append(nameCell, sizeCell, pathCell, actionsCell);
+  tbody.appendChild(tr);
+}
+
+// 4. Cookies & Session Management
+function setupCookies() {
+  const setBtn = document.getElementById('btn-set-cookie');
+  const clearBtn = document.getElementById('btn-clear-cookie');
+  const userInp = document.getElementById('username-input');
+
+  if (setBtn) {
+    setBtn.addEventListener('click', async () => {
+      const username = userInp.value || 'auditor';
+      logToConsole(`Requesting server session for user "${username}"`, 'get');
+      try {
+        const res = await fetch(`/session?user=${encodeURIComponent(username)}`);
+        const data = await res.json();
+        updateCookiesDisplay();
+        logToConsole(`Session ${data.session_id}, visits=${data.visits}`, 'system');
+      } catch (err) {
+        logToConsole(`Session request failed: ${err.message}`, 'error');
+      }
+    });
+  }
+
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      document.cookie = "session_id=; path=/; max-age=0";
+      updateCookiesDisplay();
+      logToConsole('Cleared cookies session', 'system');
+    });
+  }
+}
+
+function updateCookiesDisplay() {
+  const display = document.getElementById('cookie-display');
+  const summary = document.getElementById('cookie-summary');
+  const badge = document.getElementById('session-status-badge');
+  const cookies = document.cookie;
+
+  if (display) display.textContent = cookies ? cookies : '(No cookies set for this origin)';
+  if (summary) summary.textContent = cookies ? cookies.split(';').length + ' item(s)' : 'None';
+  if (badge) {
+    if (cookies.includes('session_id=')) {
+      badge.textContent = 'Authenticated Session';
+      badge.className = 'badge';
+      badge.style.backgroundColor = '#dcfce7';
+      badge.style.color = '#166534';
+    } else {
+      badge.textContent = 'Guest';
+      badge.className = 'badge';
+      badge.style.backgroundColor = '#f1f5f9';
+      badge.style.color = '#64748b';
+    }
+  }
+}
+
+// 5. CGI Execution
+function setupCgi() {
+  const execBtn = document.getElementById('btn-exec-cgi');
+  if (!execBtn) return;
+
+  execBtn.addEventListener('click', async () => {
+    const script = document.getElementById('cgi-script-select').value;
+    const method = document.getElementById('cgi-method').value;
+    const query = document.getElementById('cgi-query').value;
+    const pathInfo = document.getElementById('cgi-path-info').value;
+    const resultBox = document.getElementById('cgi-result');
+
+    resultBox.textContent = 'Executing CGI process...';
+    const targetUrl = `${script}${pathInfo}${query ? '?' + query : ''}`;
+
+    logToConsole(`Invoking CGI: ${method} ${targetUrl}`, 'get');
+    try {
+      const options = { method: method };
+      if (method === 'POST') {
+        options.headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+        options.body = query;
+      }
+      const res = await fetch(targetUrl, options);
+      const text = await res.text();
+      resultBox.textContent = `HTTP Status: ${res.status} ${res.statusText}\n\n--- CGI Output ---\n${text}`;
+      logToConsole(`CGI executed. Response size: ${text.length} bytes`, 'system');
+    } catch (err) {
+      resultBox.textContent = `Failed to connect to CGI: ${err.message}\n\nEnsure your Rust/C++ server maps this CGI route.`;
+      logToConsole(`CGI Error: ${err.message}`, 'error');
+    }
+  });
+}

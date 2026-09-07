@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>01-Edu Localhost Server Test Suite</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="navbar">
+    <div class="container nav-content">
+      <div class="brand">
+        <span class="badge">HTTP/1.1</span>
+        <h1>Localhost Web Server</h1>
+      </div>
+      <nav class="nav-links">
+        <a href="#methods">Methods & Uploads</a>
+        <a href="#cookies">Cookies & Session</a>
+        <a href="#cgi">CGI Tester</a>
+        <a href="#errors">Error Pages</a>
+        <a href="/gallery.html">Uploads Gallery</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- Server Status Banner -->
+    <section class="card banner-card">
+      <div class="banner-info">
+        <h2>01-Edu Subject Testbed</h2>
+        <p>This frontend evaluates all compliance rules for the Rust/C++ HTTP/1.1 server project: non-blocking epoll I/O, GET/POST/DELETE, file uploads, cookies/sessions, chunked encoding, CGI scripts, and custom error pages.</p>
+      </div>
+      <div class="server-meta" id="server-meta">
+        <div class="meta-item">
+          <span class="label">Client Time:</span>
+          <span class="val" id="client-time">--:--:--</span>
+        </div>
+        <div class="meta-item">
+          <span class="label">Active Cookies:</span>
+          <span class="val" id="cookie-summary">None</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 1: HTTP Methods & File Uploads -->
+    <section id="methods" class="section">
+      <div class="section-header">
+        <h2>1. HTTP Methods (GET, POST, DELETE) & File Uploads</h2>
+        <p>Complies with: "It manages at least [GET, POST, DELETE] methods" & "able to receive file uploads"</p>
+      </div>
+
+      <div class="grid grid-2">
+        <!-- GET & POST Form -->
+        <div class="card">
+          <h3>Standard Form Submissions</h3>
+          
+          <form id="get-form" action="/" method="GET" class="test-form">
+            <h4>GET Request Form</h4>
+            <div class="form-group">
+              <label for="get-query">Search Query (?query=...):</label>
+              <input type="text" id="get-query" name="query" value="rust-http-server" placeholder="Enter query string">
+            </div>
+            <button type="submit" class="btn btn-primary">Submit GET</button>
+          </form>
+
+          <hr class="divider">
+
+          <form id="post-json-form" class="test-form">
+            <h4>POST JSON / Text Payload</h4>
+            <div class="form-group">
+              <label for="post-payload">Payload Body:</label>
+              <textarea id="post-payload" rows="3">{"message": "Hello from 01-edu client", "status": "testing"}</textarea>
+            </div>
+            <button type="button" id="btn-post-json" class="btn btn-primary">Send POST (JSON)</button>
+          </form>
+        </div>
+
+        <!-- File Upload Form (POST multipart/form-data & Chunked) -->
+        <div class="card">
+          <h3>File Upload & Chunked Transfer</h3>
+          <p class="desc-text">Test file upload limit (client_max_body_size) and multipart parsing.</p>
+
+          <form id="upload-form" class="upload-form">
+            <div class="drop-zone" id="drop-zone">
+              <p>Drag and drop a file here or click to select</p>
+              <input type="file" id="file-input" name="file">
+            </div>
+            
+            <div class="action-row">
+              <button type="button" id="btn-upload-standard" class="btn btn-primary">POST Multipart Upload</button>
+              <button type="button" id="btn-upload-chunked" class="btn btn-secondary">POST Chunked Transfer</button>
+            </div>
+          </form>
+
+          <div class="test-payload-buttons">
+            <span>Quick limit test:</span>
+            <button type="button" class="btn btn-xs" onclick="testPayloadSize(10)">10 KB</button>
+            <button type="button" class="btn btn-xs" onclick="testPayloadSize(500)">500 KB</button>
+            <button type="button" class="btn btn-xs btn-danger" onclick="testPayloadSize(5000)">5 MB (Expect 413)</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 2: Uploaded Files & DELETE Method -->
+    <section id="delete" class="section">
+      <div class="section-header">
+        <h2>2. DELETE Method & Uploaded Files Management</h2>
+        <p>Send real <code>DELETE /uploads/{file}</code> requests to verify server resource removal.</p>
+      </div>
+
+      <div class="card">
+        <div class="table-actions">
+          <h3>Server Uploads Storage</h3>
+          <button id="btn-refresh-files" class="btn btn-sm btn-outline">Refresh File List</button>
+        </div>
+
+        <div class="table-responsive">
+          <table class="data-table" id="files-table">
+            <thead>
+              <tr>
+                <th>Filename</th>
+                <th>Estimated Size</th>
+                <th>Target URL</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="files-list">
+              <tr><td colspan="4">Loading /uploads/...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 3: Cookies & Session Tracking -->
+    <section id="cookies" class="section">
+      <div class="section-header">
+        <h2>3. Cookies & Session Management</h2>
+        <p>Subject rule: "It handles cookies and sessions."</p>
+      </div>
+
+      <div class="grid grid-2">
+        <div class="card">
+          <h3>Session Simulator</h3>
+          <p class="desc-text">Log in to send or receive a <code>Set-Cookie: session_id=...</code> header.</p>
+          
+          <div class="form-group">
+            <label for="username-input">User Name:</label>
+            <input type="text" id="username-input" value="auditor_01" placeholder="Enter auditor name">
+          </div>
+
+          <div class="action-row">
+            <button type="button" id="btn-set-cookie" class="btn btn-primary">Simulate Login (Set-Cookie)</button>
+            <button type="button" id="btn-clear-cookie" class="btn btn-outline">Logout (Clear Cookies)</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>Current Browser & Server Cookies</h3>
+          <pre class="code-box" id="cookie-display">document.cookie: loading...</pre>
+          <div class="session-status">
+            <span class="label">Session Status:</span>
+            <span id="session-status-badge" class="badge">Guest</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 4: CGI (Common Gateway Interface) -->
+    <section id="cgi" class="section">
+      <div class="section-header">
+        <h2>4. CGI Execution (Python & PHP)</h2>
+        <p>Subject rule: "Based on file extension the server will execute corresponding CGI... fork a new process, check PATH_INFO, EOF as end of body."</p>
+      </div>
+
+      <div class="card">
+        <div class="grid grid-2">
+          <div class="cgi-form-col">
+            <div class="form-group">
+              <label for="cgi-script-select">CGI Target Script:</label>
+              <select id="cgi-script-select">
+                <option value="/cgi-bin/test.py">Python: /cgi-bin/test.py</option>
+                <option value="/cgi-bin/test.php">PHP: /cgi-bin/test.php</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label for="cgi-method">Method:</label>
+              <select id="cgi-method">
+                <option value="GET">GET (Query String)</option>
+                <option value="POST">POST (Body on stdin)</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label for="cgi-query">Query String / Parameters (e.g. name=Alex&action=eval):</label>
+              <input type="text" id="cgi-query" value="name=Auditor&num1=21&num2=2">
+            </div>
+
+            <div class="form-group">
+              <label for="cgi-path-info">PATH_INFO (e.g. /extra/api/test):</label>
+              <input type="text" id="cgi-path-info" value="/test/audit">
+            </div>
+
+            <button type="button" id="btn-exec-cgi" class="btn btn-primary">Execute CGI Script</button>
+          </div>
+
+          <div class="cgi-output-col">
+            <h4>CGI Standard Output:</h4>
+            <div id="cgi-result" class="code-box pre-wrap">Click "Execute CGI Script" to run.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Section 5: Default Error Pages -->
+    <section id="errors" class="section">
+      <div class="section-header">
+        <h2>5. Default Error Pages Testbed</h2>
+        <p>Subject rule: "You should create default error pages for at least [400, 403, 404, 405, 413, 500]"</p>
+      </div>
+
+      <div class="grid grid-3">
+        <div class="card text-center">
+          <span class="status-code">400</span>
+          <h3>Bad Request</h3>
+          <p class="desc-text">Malformed HTTP request or invalid syntax</p>
+          <a href="/error_pages/400.html" target="_blank" class="btn btn-sm btn-outline">View 400.html</a>
+        </div>
+
+        <div class="card text-center">
+          <span class="status-code">403</span>
+          <h3>Forbidden</h3>
+          <p class="desc-text">Permission denied or autoindex off without default index</p>
+          <a href="/error_pages/403.html" target="_blank" class="btn btn-sm btn-outline">View 403.html</a>
+        </div>
+
+        <div class="card text-center">
+          <span class="status-code">404</span>
+          <h3>Not Found</h3>
+          <p class="desc-text">Resource does not exist on filesystem</p>
+          <a href="/non-existent-page-404" target="_blank" class="btn btn-sm btn-outline">Trigger 404</a>
+        </div>
+
+        <div class="card text-center">
+          <span class="status-code">405</span>
+          <h3>Method Not Allowed</h3>
+          <p class="desc-text">Route accepts GET only, client sent POST or DELETE</p>
+          <a href="/error_pages/405.html" target="_blank" class="btn btn-sm btn-outline">View 405.html</a>
+        </div>
+
+        <div class="card text-center">
+          <span class="status-code">413</span>
+          <h3>Payload Too Large</h3>
+          <p class="desc-text">Body exceeds client_max_body_size</p>
+          <a href="/error_pages/413.html" target="_blank" class="btn btn-sm btn-outline">View 413.html</a>
+        </div>
+
+        <div class="card text-center">
+          <span class="status-code">500</span>
+          <h3>Internal Server Error</h3>
+          <p class="desc-text">CGI failure, crash recovery, or unhandled server fault</p>
+          <a href="/error_pages/500.html" target="_blank" class="btn btn-sm btn-outline">View 500.html</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- Response Console -->
+    <section class="section">
+      <div class="card">
+        <h3>Live HTTP Inspector Log</h3>
+        <p class="desc-text">Real-time inspection of browser network requests and server response headers.</p>
+        <div class="console-box" id="http-console">
+          <div class="log-entry system">[SYSTEM] HTTP/1.1 Auditor ready. Listening for requests...</div>
+        </div>
+        <div class="console-actions">
+          <button id="btn-clear-console" class="btn btn-xs btn-outline">Clear Console</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-content">
+      <p>01-Edu "Localhost" Project Frontend &bull; Compatible with Rust/C++ HTTP/1.1 non-blocking servers</p>
+    </div>
+  </footer>
+
+  <script src="/script.js"></script>
+</body>
+</html>

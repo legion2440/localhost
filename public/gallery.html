@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Uploads Gallery - 01-Edu Localhost</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="navbar">
+    <div class="container nav-content">
+      <div class="brand">
+        <span class="badge">HTTP DELETE Audit</span>
+        <h1>Uploads & Media Gallery</h1>
+      </div>
+      <nav class="nav-links">
+        <a href="/index.html">&larr; Back to Main Test Suite</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container section">
+    <div class="card">
+      <div class="table-actions">
+        <div>
+          <h2>Server Uploaded Files</h2>
+          <p class="desc-text">This page reads the server's <code>/uploads/</code> autoindex and sends real <code>DELETE</code> requests.</p>
+        </div>
+        <button id="refresh-gallery" class="btn btn-sm btn-outline" type="button">Refresh</button>
+      </div>
+      <div id="gallery-grid" class="grid grid-3" style="margin-top: 20px;"></div>
+    </div>
+  </main>
+
+  <script>
+    const grid = document.getElementById('gallery-grid');
+
+    async function loadGallery() {
+      grid.replaceChildren();
+      try {
+        const response = await fetch('/uploads/', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const markup = await response.text();
+        const doc = new DOMParser().parseFromString(markup, 'text/html');
+        const names = [...doc.querySelectorAll('a[href]')]
+          .map(anchor => anchor.textContent.trim().replace(/\/$/, ''))
+          .filter(name => name && name !== '..');
+
+        if (!names.length) {
+          const empty = document.createElement('p');
+          empty.className = 'desc-text';
+          empty.textContent = 'No uploaded files yet.';
+          grid.appendChild(empty);
+          return;
+        }
+
+        names.forEach(renderFileCard);
+      } catch (error) {
+        const message = document.createElement('p');
+        message.className = 'desc-text';
+        message.textContent = `Unable to read /uploads/: ${error.message}`;
+        grid.appendChild(message);
+      }
+    }
+
+    function renderFileCard(name) {
+      const card = document.createElement('div');
+      card.className = 'card';
+
+      const title = document.createElement('h4');
+      title.textContent = name;
+
+      const description = document.createElement('p');
+      description.className = 'desc-text';
+      description.textContent = 'Uploaded server resource';
+
+      const actions = document.createElement('div');
+      actions.className = 'action-row';
+
+      const url = `/uploads/${encodeURIComponent(name)}`;
+      const view = document.createElement('a');
+      view.href = url;
+      view.target = '_blank';
+      view.rel = 'noopener';
+      view.className = 'btn btn-xs btn-outline';
+      view.textContent = 'View (GET)';
+
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'btn btn-xs btn-danger';
+      remove.textContent = 'DELETE';
+      remove.addEventListener('click', () => deleteTarget(name));
+
+      actions.append(view, remove);
+      card.append(title, description, actions);
+      grid.appendChild(card);
+    }
+
+    async function deleteTarget(name) {
+      const url = `/uploads/${encodeURIComponent(name)}`;
+      if (!confirm(`Execute HTTP DELETE request on ${url}?`)) return;
+      try {
+        const response = await fetch(url, { method: 'DELETE' });
+        alert(`Server response: HTTP ${response.status} ${response.statusText}`);
+        if (response.ok) await loadGallery();
+      } catch (error) {
+        alert(`DELETE request error: ${error.message}`);
+      }
+    }
+
+    document.getElementById('refresh-gallery').addEventListener('click', loadGallery);
+    loadGallery();
+  </script>
+</body>
+</html>
