@@ -92,9 +92,8 @@ server {
             check=False,
         )
         check(
-            "duplicate server_name on shared listener is detected",
-            result.returncode == 0
-            and "1 valid server block" in result.stdout
+            "duplicate server_name makes --check-config fail",
+            result.returncode != 0
             and "duplicate server_name" in result.stderr,
         )
     finally:

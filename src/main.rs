@@ -34,7 +34,7 @@ fn main() {
         }
     }
 
-    let configs = match load_config(&config_path) {
+    let configs = match load_config(&config_path, check_only) {
         Ok(configs) => configs,
         Err(err) => {
             eprintln!("configuration error: {err}");

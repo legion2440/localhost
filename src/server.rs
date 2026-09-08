@@ -961,20 +961,20 @@ impl HttpServer {
             .get(&client_fd)
             .map(CgiTask::wants_write)
             .unwrap_or(false);
-        let operation = if flags & libc::EPOLLIN as u32 != 0 {
-            CgiIoOperation::Read
-        } else if wants_write && flags & libc::EPOLLOUT as u32 != 0 {
-            CgiIoOperation::Write
-        } else if flags & (libc::EPOLLRDHUP | libc::EPOLLHUP) as u32 != 0 {
-            CgiIoOperation::Read
-        } else {
-            return;
+        let can_read = flags & (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLHUP) as u32 != 0;
+        let can_write = wants_write && flags & libc::EPOLLOUT as u32 != 0;
+        let operation = match (can_read, can_write) {
+            (true, true) => CgiIoOperation::ReadWrite,
+            (true, false) => CgiIoOperation::Read,
+            (false, true) => CgiIoOperation::Write,
+            (false, false) => return,
         };
 
         let result = match self.cgi_tasks.get_mut(&client_fd) {
             Some(task) => match operation {
                 CgiIoOperation::Read => task.read_once(),
                 CgiIoOperation::Write => task.write_once(),
+                CgiIoOperation::ReadWrite => task.read_once().and_then(|_| task.write_once()),
             },
             None => return,
         };
@@ -1283,6 +1283,7 @@ enum CgiFinish {
 enum CgiIoOperation {
     Read,
     Write,
+    ReadWrite,
 }
 
 impl Drop for HttpServer {

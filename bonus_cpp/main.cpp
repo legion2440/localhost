@@ -20,11 +20,34 @@ int main(int argc, char** argv) {
     }
 
     try {
-        auto configs = load_config(config_path);
         if (check_config) {
+            std::ifstream file(config_path);
+            if (!file) {
+                throw std::runtime_error("cannot read config");
+            }
+            std::stringstream buffer;
+            buffer << file.rdbuf();
+            const auto blocks = server_blocks(buffer.str());
+            std::vector<ServerConfig> configs;
+            for (size_t i = 0; i < blocks.size(); ++i) {
+                ServerConfig candidate = parse_server(blocks[i]);
+                for (const auto& existing : configs) {
+                    if (const auto conflict = server_conflict(existing, candidate)) {
+                        throw std::runtime_error(
+                            "server #" + std::to_string(i + 1) + ": " + *conflict
+                        );
+                    }
+                }
+                configs.push_back(std::move(candidate));
+            }
+            if (configs.empty()) {
+                throw std::runtime_error("no valid server blocks");
+            }
             std::cout << "configuration OK: " << configs.size() << " valid server block(s)\n";
             return 0;
         }
+
+        auto configs = load_config(config_path);
         App app(std::move(configs));
         app.run();
     } catch (const std::exception& error) {

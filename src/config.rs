@@ -62,13 +62,17 @@ struct RawServer {
     lines: Vec<String>,
 }
 
-pub fn load_config(path: &Path) -> Result<Vec<ServerConfig>, String> {
+pub fn load_config(path: &Path, strict: bool) -> Result<Vec<ServerConfig>, String> {
     let text = fs::read_to_string(path)
         .map_err(|e| format!("cannot read configuration {}: {e}", path.display()))?;
-    parse_config(&text)
+    parse_config_with_mode(&text, strict)
 }
 
 pub fn parse_config(text: &str) -> Result<Vec<ServerConfig>, String> {
+    parse_config_with_mode(text, false)
+}
+
+fn parse_config_with_mode(text: &str, strict: bool) -> Result<Vec<ServerConfig>, String> {
     let raw_servers = split_server_blocks(text)?;
     if raw_servers.is_empty() {
         return Err("configuration contains no server blocks".into());
@@ -96,7 +100,7 @@ pub fn parse_config(text: &str) -> Result<Vec<ServerConfig>, String> {
         eprintln!("config warning: {err}");
     }
 
-    if valid.is_empty() {
+    if valid.is_empty() || (strict && !errors.is_empty()) {
         return Err(errors.join("; "));
     }
     Ok(valid)
@@ -467,6 +471,7 @@ mod tests {
         let servers = parse_config(cfg).unwrap();
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].server_names, vec!["same.test"]);
+        assert!(parse_config_with_mode(cfg, true).is_err());
     }
 
     #[test]
