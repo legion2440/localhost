@@ -257,15 +257,18 @@
         if (task_it == cgis.end()) {
             return;
         }
-        CgiTask& task = task_it->second;
 
         if ((flags & EPOLLERR) != 0) {
             finish_cgi(client_fd, CgiFinishKind::Failed, "CGI channel error");
             return;
         }
 
-        if ((flags & EPOLLIN) != 0 ||
-            (((flags & (EPOLLRDHUP | EPOLLHUP)) != 0) && (flags & EPOLLOUT) == 0)) {
+        const bool can_read = (flags & EPOLLIN) != 0
+            || (((flags & (EPOLLRDHUP | EPOLLHUP)) != 0) && (flags & EPOLLOUT) == 0);
+        const bool can_write = !task_it->second.input_closed && (flags & EPOLLOUT) != 0;
+
+        if (can_read) {
+            CgiTask& task = task_it->second;
             char buffer[65536];
             const ssize_t count = recv(io_fd, buffer, sizeof(buffer), 0);
             if (count > 0) {
@@ -280,7 +283,14 @@
                 finish_cgi(client_fd, CgiFinishKind::Failed, "CGI read failed");
                 return;
             }
-        } else if (!task.input_closed && (flags & EPOLLOUT) != 0) {
+        }
+
+        task_it = cgis.find(client_fd);
+        if (task_it == cgis.end()) {
+            return;
+        }
+        if (can_write && !task_it->second.input_closed) {
+            CgiTask& task = task_it->second;
             const ssize_t count = send(
                 io_fd,
                 task.input.data() + static_cast<std::ptrdiff_t>(task.input_pos),
