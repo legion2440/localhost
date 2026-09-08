@@ -65,7 +65,11 @@ struct RawServer {
 pub fn load_config(path: &Path, strict: bool) -> Result<Vec<ServerConfig>, String> {
     let text = fs::read_to_string(path)
         .map_err(|e| format!("cannot read configuration {}: {e}", path.display()))?;
-    parse_config_with_mode(&text, strict)
+    if strict {
+        parse_config_with_mode(&text, true)
+    } else {
+        parse_config(&text)
+    }
 }
 
 pub fn parse_config(text: &str) -> Result<Vec<ServerConfig>, String> {
