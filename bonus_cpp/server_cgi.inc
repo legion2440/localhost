@@ -326,20 +326,24 @@
         if (task_it == cgis.end()) {
             return;
         }
-        uint32_t interests = EPOLLIN | EPOLLRDHUP;
-        if (!task_it->second.input_closed) {
-            interests |= EPOLLOUT;
-        }
-        try {
-            ctl(
-                EPOLL_CTL_MOD,
-                io_fd,
-                interests,
-                event_token(io_fd, task_it->second.io_generation)
-            );
-        } catch (...) {
-            finish_cgi(client_fd, CgiFinishKind::Failed, "cannot update CGI epoll interest");
-            return;
+        if (task_it->second.io_eof) {
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, io_fd, nullptr);
+        } else {
+            uint32_t interests = EPOLLIN | EPOLLRDHUP;
+            if (!task_it->second.input_closed) {
+                interests |= EPOLLOUT;
+            }
+            try {
+                ctl(
+                    EPOLL_CTL_MOD,
+                    io_fd,
+                    interests,
+                    event_token(io_fd, task_it->second.io_generation)
+                );
+            } catch (...) {
+                finish_cgi(client_fd, CgiFinishKind::Failed, "cannot update CGI epoll interest");
+                return;
+            }
         }
 
         if (task_it->second.io_eof && task_it->second.process_exited) {

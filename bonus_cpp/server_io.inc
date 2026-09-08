@@ -30,7 +30,20 @@ public:
     void run() {
         std::vector<epoll_event> events(MAX_EVENTS);
         for (;;) {
-            const int count = epoll_wait(epoll_fd, events.data(), static_cast<int>(events.size()), 100);
+            int wait_timeout = 100;
+            for (const auto& [fd, task] : cgis) {
+                (void)fd;
+                if (task.io_eof && !task.process_exited) {
+                    wait_timeout = 10;
+                    break;
+                }
+            }
+            const int count = epoll_wait(
+                epoll_fd,
+                events.data(),
+                static_cast<int>(events.size()),
+                wait_timeout
+            );
             if (count < 0) {
                 if (errno == EINTR) {
                     continue;

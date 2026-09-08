@@ -3,6 +3,7 @@ import sys
 import os
 import urllib.parse
 import html
+import time
 from datetime import datetime
 
 # CGI Output Header
@@ -18,6 +19,19 @@ cookie = os.environ.get("HTTP_COOKIE", "None")
 if path_info == "/early-exit":
     print("CGI OK, body ignored")
     sys.stdout.flush()
+    raise SystemExit(0)
+
+if path_info == "/eof-before-exit":
+    print("CGI OK, EOF before exit")
+    sys.stdout.flush()
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, stdin_fd)
+    os.dup2(devnull, stdout_fd)
+    if devnull not in (stdin_fd, stdout_fd):
+        os.close(devnull)
+    time.sleep(0.4)
     raise SystemExit(0)
 
 # Read Body until EOF (as required by 01-edu subject)

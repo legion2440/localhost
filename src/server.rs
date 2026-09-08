@@ -145,12 +145,21 @@ impl HttpServer {
     pub fn run(&mut self) -> io::Result<()> {
         let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
         loop {
+            let wait_timeout = if self
+                .cgi_tasks
+                .values()
+                .any(|task| task.io_eof && !task.process_exited)
+            {
+                10
+            } else {
+                100
+            };
             let count = unsafe {
                 libc::epoll_wait(
                     self.epoll_fd,
                     events.as_mut_ptr(),
                     events.len() as i32,
-                    100,
+                    wait_timeout,
                 )
             };
             if count < 0 {
@@ -994,28 +1003,47 @@ impl HttpServer {
             return;
         }
 
-        let interests = self.cgi_tasks.get(&client_fd).map(|task| {
-            let mut value = (libc::EPOLLIN | libc::EPOLLRDHUP) as u32;
-            if task.wants_write() {
-                value |= libc::EPOLLOUT as u32;
-            }
-            value
-        });
-        if let Some(interests) = interests {
-            if self
-                .epoll_ctl_with_token(
-                    libc::EPOLL_CTL_MOD,
+        let io_eof = self
+            .cgi_tasks
+            .get(&client_fd)
+            .map(|task| task.io_eof)
+            .unwrap_or(false);
+        if io_eof {
+            unsafe {
+                libc::epoll_ctl(
+                    self.epoll_fd,
+                    libc::EPOLL_CTL_DEL,
                     io_fd,
-                    interests,
-                    event_token(
+                    std::ptr::null_mut(),
+                );
+            }
+        } else {
+            let interests = self.cgi_tasks.get(&client_fd).map(|task| {
+                let mut value = (libc::EPOLLIN | libc::EPOLLRDHUP) as u32;
+                if task.wants_write() {
+                    value |= libc::EPOLLOUT as u32;
+                }
+                value
+            });
+            if let Some(interests) = interests {
+                if self
+                    .epoll_ctl_with_token(
+                        libc::EPOLL_CTL_MOD,
                         io_fd,
-                        self.cgi_tasks[&client_fd].io_generation,
-                    ),
-                )
-                .is_err()
-            {
-                self.finish_cgi(client_fd, CgiFinish::Failed("cannot update CGI epoll interest".into()));
-                return;
+                        interests,
+                        event_token(
+                            io_fd,
+                            self.cgi_tasks[&client_fd].io_generation,
+                        ),
+                    )
+                    .is_err()
+                {
+                    self.finish_cgi(
+                        client_fd,
+                        CgiFinish::Failed("cannot update CGI epoll interest".into()),
+                    );
+                    return;
+                }
             }
         }
 

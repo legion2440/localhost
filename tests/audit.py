@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +50,13 @@ def check(label: str, condition: bool):
     if not condition:
         raise AssertionError(label)
     print(f"[OK] {label}")
+
+
+def process_cpu_seconds(pid: int) -> float:
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    fields = stat[stat.rfind(")") + 2:].split()
+    ticks = int(fields[11]) + int(fields[12])
+    return ticks / os.sysconf("SC_CLK_TCK")
 
 
 def make_config() -> Path:
@@ -311,6 +319,29 @@ def run(binary: Path):
         )
         status, _, _ = request("GET", "/")
         check("server survives chunked early CGI stdin close", status == 200 and proc.poll() is None)
+
+        delayed_result: dict[str, object] = {}
+
+        def delayed_cgi_request():
+            try:
+                delayed_result["response"] = request("GET", "/cgi-bin/test.py/eof-before-exit")
+            except Exception as error:
+                delayed_result["error"] = error
+
+        cpu_before = process_cpu_seconds(proc.pid)
+        worker = threading.Thread(target=delayed_cgi_request)
+        worker.start()
+        worker.join(timeout=2)
+        cpu_used = process_cpu_seconds(proc.pid) - cpu_before
+        delayed_response = delayed_result.get("response")
+        check(
+            "CGI EOF wait does not busy-spin",
+            not worker.is_alive()
+            and delayed_response is not None
+            and delayed_response[0] == 200
+            and b"CGI OK, EOF before exit" in delayed_response[2]
+            and cpu_used < 0.15,
+        )
 
         if shutil.which("php-cgi"):
             status, _, body = request("GET", "/cgi-bin/test.php/bonus?name=Auditor")
