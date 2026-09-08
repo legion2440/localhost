@@ -951,17 +951,15 @@ impl HttpServer {
             Some(entry) => entry.client_fd,
             None => return,
         };
-        if flags & libc::EPOLLERR as u32 != 0 {
-            self.finish_cgi(client_fd, CgiFinish::Failed("CGI pipe error".into()));
-            return;
-        }
 
         let wants_write = self
             .cgi_tasks
             .get(&client_fd)
             .map(CgiTask::wants_write)
             .unwrap_or(false);
-        let can_read = flags & (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLHUP) as u32 != 0;
+        let can_read = flags
+            & (libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLHUP | libc::EPOLLERR) as u32
+            != 0;
         let can_write = wants_write && flags & libc::EPOLLOUT as u32 != 0;
         let operation = match (can_read, can_write) {
             (true, true) => CgiIoOperation::ReadWrite,

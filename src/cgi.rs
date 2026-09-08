@@ -109,6 +109,7 @@ impl CgiTask {
         match self.io.read(&mut buffer) {
             Ok(0) => {
                 self.io_eof = true;
+                self.input_closed = true;
                 Ok(())
             }
             Ok(count) => {
@@ -116,6 +117,16 @@ impl CgiTask {
                 Ok(())
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected
+                ) =>
+            {
+                self.io_eof = true;
+                self.input_closed = true;
+                Ok(())
+            }
             Err(err) => Err(err),
         }
     }

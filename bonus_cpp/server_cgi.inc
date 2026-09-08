@@ -262,12 +262,7 @@
             return;
         }
 
-        if ((flags & EPOLLERR) != 0) {
-            finish_cgi(client_fd, CgiFinishKind::Failed, "CGI channel error");
-            return;
-        }
-
-        const bool can_read = (flags & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) != 0;
+        const bool can_read = (flags & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) != 0;
         const bool can_write = !task_it->second.input_closed && (flags & EPOLLOUT) != 0;
 
         if (can_read) {
@@ -283,7 +278,12 @@
             } else if (count == 0) {
                 task.io_eof = true;
                 task.input_closed = true;
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Wait for the next readiness event.
+            } else if (errno == ECONNRESET || errno == ENOTCONN) {
+                task.io_eof = true;
+                task.input_closed = true;
+            } else {
                 finish_cgi(client_fd, CgiFinishKind::Failed, "CGI read failed");
                 return;
             }
