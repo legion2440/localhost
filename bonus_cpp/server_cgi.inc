@@ -66,6 +66,10 @@
         Failed,
     };
 
+    static bool cgi_input_closed_errno(int value) {
+        return value == EPIPE || value == ECONNRESET || value == ENOTCONN;
+    }
+
     std::optional<CgiSpec> find_cgi(const Route& route, const std::string& path) const {
         if (route.cgi.empty()) {
             return std::nullopt;
@@ -172,7 +176,7 @@
         task.keep_alive = keep_alive;
         task.started = Clock::now();
         if (task.input.empty()) {
-            if (shutdown(task.io_fd, SHUT_WR) < 0 && errno != ENOTCONN) {
+            if (shutdown(task.io_fd, SHUT_WR) < 0 && !cgi_input_closed_errno(errno)) {
                 kill(pid, SIGKILL);
                 waitpid(pid, nullptr, 0);
                 close(task.io_fd);
@@ -263,8 +267,7 @@
             return;
         }
 
-        const bool can_read = (flags & EPOLLIN) != 0
-            || (((flags & (EPOLLRDHUP | EPOLLHUP)) != 0) && (flags & EPOLLOUT) == 0);
+        const bool can_read = (flags & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) != 0;
         const bool can_write = !task_it->second.input_closed && (flags & EPOLLOUT) != 0;
 
         if (can_read) {
@@ -279,6 +282,7 @@
                 }
             } else if (count == 0) {
                 task.io_eof = true;
+                task.input_closed = true;
             } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 finish_cgi(client_fd, CgiFinishKind::Failed, "CGI read failed");
                 return;
@@ -289,7 +293,7 @@
         if (task_it == cgis.end()) {
             return;
         }
-        if (can_write && !task_it->second.input_closed) {
+        if (can_write && !task_it->second.input_closed && !task_it->second.io_eof) {
             CgiTask& task = task_it->second;
             const ssize_t count = send(
                 io_fd,
@@ -300,16 +304,19 @@
             if (count > 0) {
                 task.input_pos += static_cast<size_t>(count);
                 if (task.input_pos == task.input.size()) {
-                    if (shutdown(io_fd, SHUT_WR) < 0 && errno != ENOTCONN) {
+                    if (shutdown(io_fd, SHUT_WR) < 0 && !cgi_input_closed_errno(errno)) {
                         finish_cgi(client_fd, CgiFinishKind::Failed, "CGI stdin shutdown failed");
                         return;
                     }
                     task.input_closed = true;
                 }
             } else if (count == 0) {
-                finish_cgi(client_fd, CgiFinishKind::Failed, "CGI stdin closed early");
-                return;
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                task.input_closed = true;
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Try again when epoll reports the socket writable.
+            } else if (cgi_input_closed_errno(errno)) {
+                task.input_closed = true;
+            } else {
                 finish_cgi(client_fd, CgiFinishKind::Failed, "CGI write failed");
                 return;
             }

@@ -40,6 +40,15 @@ pub struct CgiTask {
     pub process_exited: bool,
 }
 
+fn cgi_input_closed_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+    )
+}
+
 impl CgiTask {
     pub fn timed_out(&self) -> bool {
         self.started.elapsed() >= self.timeout
@@ -55,22 +64,30 @@ impl CgiTask {
 
     pub fn close_input(&mut self) -> io::Result<()> {
         if !self.input_closed {
-            self.io.shutdown(Shutdown::Write)?;
+            match self.io.shutdown(Shutdown::Write) {
+                Ok(()) => {}
+                Err(err) if cgi_input_closed_error(&err) => {}
+                Err(err) => return Err(err),
+            }
             self.input_closed = true;
         }
         Ok(())
     }
 
     pub fn write_once(&mut self) -> io::Result<()> {
+        if self.io_eof {
+            self.input_closed = true;
+            return Ok(());
+        }
         if !self.wants_write() {
             self.close_input()?;
             return Ok(());
         }
         match self.io.write(&self.input[self.input_pos..]) {
-            Ok(0) => Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "CGI stdin closed before request body was written",
-            )),
+            Ok(0) => {
+                self.input_closed = true;
+                Ok(())
+            }
             Ok(count) => {
                 self.input_pos += count;
                 if self.input_pos == self.input.len() {
@@ -79,6 +96,10 @@ impl CgiTask {
                 Ok(())
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(()),
+            Err(err) if cgi_input_closed_error(&err) => {
+                self.input_closed = true;
+                Ok(())
+            }
             Err(err) => Err(err),
         }
     }

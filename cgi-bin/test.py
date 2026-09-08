@@ -15,6 +15,11 @@ path_info = os.environ.get("PATH_INFO", "")
 content_length = os.environ.get("CONTENT_LENGTH", "0")
 cookie = os.environ.get("HTTP_COOKIE", "None")
 
+if path_info == "/early-exit":
+    print("CGI OK, body ignored")
+    sys.stdout.flush()
+    raise SystemExit(0)
+
 # Read Body until EOF (as required by 01-edu subject)
 body_data = ""
 if method == "POST":

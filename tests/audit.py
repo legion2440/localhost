@@ -277,6 +277,41 @@ def run(binary: Path):
             status == 200 and cgi_large in body,
         )
 
+        cgi_early_body = b"y" * (1024 * 1024)
+        status, _, body = request(
+            "POST",
+            "/cgi-bin/test.py/early-exit",
+            cgi_early_body,
+            {"Content-Type": "application/octet-stream"},
+        )
+        check(
+            "CGI may exit without consuming Content-Length body",
+            status == 200 and b"CGI OK, body ignored" in body,
+        )
+        status, _, _ = request("GET", "/")
+        check("server survives early CGI stdin close", status == 200 and proc.poll() is None)
+
+        encoded_chunks = []
+        for offset in range(0, len(cgi_early_body), 65536):
+            part = cgi_early_body[offset:offset + 65536]
+            encoded_chunks.append(f"{len(part):X}\r\n".encode() + part + b"\r\n")
+        cgi_early_chunked = raw_http(
+            b"POST /cgi-bin/test.py/early-exit HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Content-Type: application/octet-stream\r\n"
+            b"Connection: close\r\n\r\n"
+            + b"".join(encoded_chunks)
+            + b"0\r\n\r\n"
+        )
+        check(
+            "CGI may exit without consuming decoded chunked body",
+            cgi_early_chunked.startswith(b"HTTP/1.1 200")
+            and b"CGI OK, body ignored" in cgi_early_chunked,
+        )
+        status, _, _ = request("GET", "/")
+        check("server survives chunked early CGI stdin close", status == 200 and proc.poll() is None)
+
         if shutil.which("php-cgi"):
             status, _, body = request("GET", "/cgi-bin/test.php/bonus?name=Auditor")
             check("PHP CGI bonus", status == 200 and b"PHP CGI Execution Succeeded" in body)
